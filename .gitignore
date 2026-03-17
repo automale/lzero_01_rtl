@@ -1,0 +1,15 @@
+# Scala/SBT
+target/
+project/target/
+project/project/
+.bsp/
+.metals/
+metals.sbt
+
+# VS Code
+.vscode/
+*.code-workspace
+
+# OS
+.DS_Store
+Thumbs.db
