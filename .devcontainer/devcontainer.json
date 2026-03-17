@@ -1,0 +1,14 @@
+{
+    "name": "L-ZERO RTL Track",
+    "image": "automale/lzero-rtl:v1",
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "scala-lang.scala",
+                "scalameta.metals",
+                "mshr-h.veriloghdl"
+            ]
+        }
+    },
+    "remoteUser": "root"
+}
