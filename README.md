@@ -41,6 +41,7 @@ cd lzero_01_rtl
 git submodule sync
 git submodule update --init --recursive
 ```
+---
 
 ## 🚢 3. 환경 빌드 및 초기 셋업 (Docker)
 L-ZERO 전용 Makefile을 통해 환경 구축을 자동화합니다.
@@ -57,6 +58,8 @@ make setup
 ```
 cde, diplomacy, hardfloat, rocketchip, macros 등 핵심 모듈이 자동으로 빌드됩니다.
 
+---
+
 ## ⌨️ 4. 주요 명령어 사용법 (Makefile)
 터미널에서 아래 명령어를 사용하여 개발 사이클을 관리하세요.
 명령어설명
@@ -67,12 +70,16 @@ make gen     Chisel 코드를 SystemVerilog로 컴파일
 make clean   SBT 빌드 부산물 및 생성된 Verilog 파일 삭제 (가벼운 초기화)
 make down    컨테이너 실행 종료
 
+---
+
 ## 💡 5. 개발 워크플로우 (Example)
 코드 수정: 로컬의 src/main/scala/ 경로에서 Chisel 코드를 설계합니다.
 
 Verilog 생성: 터미널에서 make gen 명령어를 실행합니다.
 
 결과 확인: 성공 시 generated/ 폴더 내에 생성된 .sv 파일을 확인합니다.
+
+---
 
 ## ⚠️ 주의사항
 메모리 할당: Docker Desktop 설정에서 최소 4GB~8GB 이상의 RAM을 할당해야 로켓칩 빌드 시 OutOfMemory 에러가 발생하지 않습니다.
