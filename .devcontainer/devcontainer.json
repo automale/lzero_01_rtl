@@ -1,6 +1,6 @@
 {
     "name": "L-ZERO RTL Track",
-    "image": "automale/lzero-rtl:v1",
+    "image": "automale/lzero-rtl:v2",
     "customizations": {
         "vscode": {
             "extensions": [
