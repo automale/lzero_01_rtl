@@ -5,6 +5,9 @@ project/target/
 bin/
 .cache/
 
+# Mill 부산물
+out/
+
 # Chisel 생성 파일 (Verilog 등)
 # 소스 코드만 공유하고, 생성물은 각자 빌드해서 쓰는 게 정석입니다.
 generated/
