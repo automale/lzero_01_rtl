@@ -1,16 +1,21 @@
-lazy val commonSettings = Seq(
-  organization := "tech.l-zero",
-  version := "0.1.0",
-  scalaVersion := "2.13.10", // Rocket Chip 권장 Scala 버전 확인 필요
-  addCompilerPlugin("org.chipsalliance" % "chisel-plugin" % "5.0.0" cross CrossVersion.full),
-  libraryDependencies ++= Seq(
-    "org.chipsalliance" %% "chisel" % "5.0.0",
-  )
-)
+// 1. 공통 빌드 설정 (Scala 2.13 환경)
+ThisBuild / scalaVersion := "2.13.12"
+ThisBuild / version      := "0.1.0"
+ThisBuild / organization := "tech.l-zero"
 
-// Rocket Chip 프로젝트를 정의하고 프로젝트의 의존성으로 추가
-lazy val rocketchip = RootProject(file("rocket-chip"))
+val chiselVersion = "6.7.0"
 
+// 2. 메인 프로젝트 정의
 lazy val lzero_pim = (project in file("."))
-  .dependsOn(rocketchip) // 우리 프로젝트가 Rocket Chip에 의존함을 명시
-  .settings(commonSettings)
+  .settings(
+    name := "lzero_pim",
+    
+    // 3. 라이브러리 및 의존성 주입 (Chisel + 로컬 캐시의 로켓칩)
+    libraryDependencies ++= Seq(
+      "org.chipsalliance" %% "chisel" % chiselVersion,
+      "org.chipsalliance" %% "rocketchip-6.7.0" % "1.6-SNAPSHOT"
+    ),
+    
+    // 4. Chisel 컴파일러 플러그인 추가
+    addCompilerPlugin("org.chipsalliance" % "chisel-plugin" % chiselVersion cross CrossVersion.full)
+  )

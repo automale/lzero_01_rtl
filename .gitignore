@@ -1,15 +1,27 @@
-# Scala/SBT
+# Scala/SBT 부산물
 target/
-project/target/
 project/project/
-.bsp/
-.metals/
-metals.sbt
+project/target/
+bin/
+.cache/
 
-# VS Code
+# Chisel 생성 파일 (Verilog 등)
+# 소스 코드만 공유하고, 생성물은 각자 빌드해서 쓰는 게 정석입니다.
+generated/
+
+# IDE 설정 (VS Code, IntelliJ)
 .vscode/
-*.code-workspace
+.idea/
+*.swp
+*.swo
+.metals/
+.bsp/
 
-# OS
+# OS 부산물
 .DS_Store
 Thumbs.db
+
+# 오늘 수동으로 설치한 툴 관련 (Dockerfile이 대신 해줄 영역)
+firtool_extracted/
+*.jar
+*.tar.gz

@@ -1,0 +1,10 @@
+services:
+  lzero-rtl:
+    build: 
+      context: .
+    # [핵심] 모든 사용자가 강제로 인텔(amd64) 환경을 쓰도록 고정
+    platform: linux/amd64
+    image: lzero-rtl-env:latest
+    volumes:
+      - .:/workspace/lzero_01_rtl
+    tty: true
