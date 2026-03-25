@@ -6,7 +6,7 @@ up:
 
 # 2. 컨테이너 내부 접속 (가장 많이 씀)
 shell:
-	zero_rtl_env /bin/bash
+	docker exec -it lzero_rtl_env /bin/bash
 
 setup:
 	@echo "Rocket-chip essential library building (5-10min)"
@@ -24,13 +24,13 @@ setup:
 
 # 3. Chisel 컴파일 및 Verilog 생성 (접속 안 하고 밖에서 바로 실행)
 gen:
-	lzero_rtl_env sbt "runMain MacUnitMain"
+	docker exec -it lzero_rtl_env sbt "runMain MacUnitMain"
 
 # 4. 종료
 down:
-	exit
+	docker compose down
 
 # 5. 청소 (Clean)
 clean:
-	lzero_rtl_env sbt clean
+	docker exec -it lzero_rtl_env sbt clean
 	rm -rf out/ generated/
