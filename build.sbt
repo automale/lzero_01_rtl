@@ -13,8 +13,13 @@ lazy val lzero_pim = (project in file("."))
     // 3. 라이브러리 및 의존성 주입 (Chisel + 로컬 캐시의 로켓칩)
     libraryDependencies ++= Seq(
       "org.chipsalliance" %% "chisel" % chiselVersion,
-      "org.chipsalliance" %% "rocketchip-6.7.0" % "1.6-SNAPSHOT"
+      // "org.chipsalliance" %% "rocketchip-6.7.0" % "1.6-SNAPSHOT"
+
+      "edu.berkeley.cs" %% "chiseltest" % "6.0.0" % Test,
+      "org.scalatest" %% "scalatest" % "3.2.16" % Test
     ),
+
+    
     
     // 4. Chisel 컴파일러 플러그인 추가
     addCompilerPlugin("org.chipsalliance" % "chisel-plugin" % chiselVersion cross CrossVersion.full)

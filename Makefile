@@ -1,5 +1,6 @@
-# L-ZERO RTL Track 간편 명령어 세트
+.PHONY: up shell setup gen test down clean
 
+# L-ZERO RTL Track 간편 명령어 세트
 # 1. 환경 빌드 및 실행
 up:
 	docker compose up -d --build
@@ -24,13 +25,17 @@ setup:
 
 # 3. Chisel 컴파일 및 Verilog 생성 (접속 안 하고 밖에서 바로 실행)
 gen:
-	docker exec -it lzero_rtl_env sbt "runMain MacUnitMain"
+	docker exec -it lzero_rtl_env sbt "runMain TPU_Main"
 
-# 4. 종료
+# 4. Chisel 컴파일 및 Verilog 생성 (접속 안 하고 밖에서 바로 실행)
+test:
+	docker exec -it lzero_rtl_env sbt test
+
+# 5. 종료
 down:
 	docker compose down
 
-# 5. 청소 (Clean)
+# 6. 청소 (Clean)
 clean:
 	docker exec -it lzero_rtl_env sbt clean
 	rm -rf out/ generated/

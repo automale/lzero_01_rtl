@@ -1,4 +1,4 @@
-import circt.stage.ChiselStage // <--- 컴파일러가 헷갈리지 않게 제일 먼저 데려옵니다!
+import circt.stage.ChiselStage // import first
 import chisel3._
 import chisel3.util._
 
@@ -25,8 +25,8 @@ class MacUnit extends Module {
     weight := io.in_w
   }
 
-  io.out_mac := (io.in_a * weight) + io.in_c
-  io.out_in := io.in_a
+  io.out_mac  := RegNext((io.in_a * weight) + io.in_c)
+  io.out_in   := RegNext(io.in_a)
 }
 
 // [2] systolic array 16 by 16
@@ -44,35 +44,36 @@ class MatMulUnit_16 extends Module {
 
   val macs = Seq.fill(16, 16)(Module(new MacUnit()))
 
-  
+  // weight loading
   for ( r <- 0 until 16 ){
     for ( c <- 0 until 16 ){
-      macs(r)(c).io.in_w := io.in_W(r)(c)
+      macs(r)(c).io.in_w  := io.in_W(r)(c)
       macs(r)(c).io.set_w := io.set_W
     }
   }
 
+  // weight clearing
   for ( r <- 0 until 16 ){
     for ( c <- 0 until 16 ){
       macs(r)(c).io.clear_w := io.clear_W
     }
   }
-  
 
-  for (r <- 0 until 16) {
-    macs(r)(0).io.in_a := io.in_A(r)
-  }
+  // wiring mac units 
+  for ( r <- 0 until 16 ){
+    for ( c <- 0 until 16 ){
+      if (c == 0) { macs(r)(0).io.in_a := io.in_A(r) }
+      else { macs(r)(c).io.in_a := macs(r)(c-1).io.out_in }
 
-  for (c <- 0 until 16) {
-    macs(0)(c).io.in_c := 0.U
-    io.out_MAC(c) := macs(15)(c).io.out_mac
-  }
-
-  for ( r <- 0 until 15 ){
-    for ( c <- 0 until 15 ){
-      macs(r)(c+1).io.in_a := macs(r)(c).io.out_in
-      macs(r+1)(c).io.in_c := macs(r)(c).io.out_mac
+      if (r == 0) { macs(r)(c).io.in_c  := 0.U }
+      else { macs(r)(c).io.in_c := macs(r-1)(c).io.out_mac }
     }
+  }
+
+  // wiring MatMulUnit's input output to each of macUnit
+  for (c <- 0 until 16) {
+    macs(0)(c).io.in_c  := 0.U                    // input C initialize
+    io.out_MAC(c)       := macs(15)(c).io.out_mac // output wiring
   }
 
 }
@@ -97,13 +98,13 @@ class Orch_buffer_16 extends Module {
     shift_reg(15) := 0.U
   }
 
-  when ( io.sync_enalbe ) {
+  when ( io.sync_enable ) {
     io.out := shift_reg(0)
   } .otherwise {
     io.out := 0.U
   }
 
-  next_sync_enable := sync_enable
+  io.next_sync_enable := io.sync_enable
 }
 
 // [4] data orchestration unit
@@ -119,25 +120,30 @@ class DataOrchUnit_16 extends Module {
   val feed_reg = RegInit(VecInit(Seq.fill(16)(false.B)))
  
   for( r<-0 until 16 ){
-    d_orch(r).io.sync_enable := feed_reg(r)
-    d_orch(r).io.load_enable := io.load_enable
-    d_orch(r).io.in := io.in_mat(r)
-    io.skew_vec(r) := d_orch(r).io.out
+    d_orch(r).io.sync_enable  := feed_reg(r)
+    d_orch(r).io.load_enable  := io.load_enable
+    d_orch(r).io.in           := io.in_mat(r)
+    io.skew_vec(r)            := d_orch(r).io.out
   }
 
   feed_reg(0) := io.feed_enable
   for ( i<-0 until 15 ){
-    feed_reg(i+1) := feed_reg(i) 
+    feed_reg(i+1) := feed_reg(i)
   }
-  
 }
 
 // [4] Chisel 6.x 문법에 맞춘 실행 객체
-object MacUnitMain extends App {
-  println("🚀 Generating SystemVerilog code for MacUnit (Chisel 6.7.0 + CIRCT)...")
+object TPU_Main extends App {
+  println("🚀 L-ZERO Accelerator의 SystemVerilog 도면을 추출합니다...")
   
-  ChiselStage.emitSystemVerilogFile(
-    new MacUnit(),
-    Array("--target-dir", "generated")
-  )
+  // 1. 가장 작은 세포 (선택사항)
+  ChiselStage.emitSystemVerilogFile(new MacUnit(), Array("--target-dir", "generated"))
+  
+  // 2. 16x16 시스톨릭 어레이 본체
+  ChiselStage.emitSystemVerilogFile(new MatMulUnit_16(), Array("--target-dir", "generated"))
+  
+  // 3. 16x16 데이터 오케스트레이터
+  ChiselStage.emitSystemVerilogFile(new DataOrchUnit_16(), Array("--target-dir", "generated"))
+  
+  println("✅ 모든 도면 생성 완료! 'generated' 폴더를 확인하십시오.")
 }
