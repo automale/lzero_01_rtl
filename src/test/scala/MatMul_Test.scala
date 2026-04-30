@@ -4,57 +4,59 @@ import org.scalatest.flatspec.AnyFlatSpec
 import scala.util.Random // 스칼라의 난수 생성기
 
 // 하드웨어 테스트를 위한 기본 클래스 상속
-// class MacUnitTest extends AnyFlatSpec with ChiselScalatestTester {
-//   behavior of "MacUnit"
+class MacUnitTest extends AnyFlatSpec with ChiselScalatestTester {
+  behavior of "MacUnit"
 
-//   // 테스트 케이스 시작
-//   it should "correctly load weight, multiply, and pass input/partial sum" in {
-//     // 칩(MacUnit)을 시뮬레이터 위에 올립니다. (dut: Device Under Test의 약자)
-//     test(new MacUnit()) { dut =>
+  // 테스트 케이스 시작
+  it should "correctly load weight, multiply, and pass input/partial sum" in {
+    // 칩(MacUnit)을 시뮬레이터 위에 올립니다. (dut: Device Under Test의 약자)
+    test(new MacUnit()) { dut =>
       
-//       // ----------------------------------------------------
-//       // [1단계] 초기화: 남아있을지 모르는 쓰레기값을 0으로 밉니다.
-//       // ----------------------------------------------------
-//       dut.io.clear_w.poke(true.B)  // clear_w 핀에 전기(1)를 찌릅니다.
-//       dut.clock.step(1)            // 클럭을 1번 "딱!" 뛰게 합니다. (이때 weight가 0으로 변함)
-//       dut.io.clear_w.poke(false.B) // clear_w 핀의 전기를 끕니다.
+      // ----------------------------------------------------
+      // [1단계] 초기화: 남아있을지 모르는 쓰레기값을 0으로 밉니다.
+      // ----------------------------------------------------
+      dut.io.clear_w.poke(true.B)  // clear_w 핀에 전기(1)를 찌릅니다.
+      dut.clock.step(1)            // 클럭을 1번 "딱!" 뛰게 합니다. (이때 weight가 0으로 변함)
+      dut.io.clear_w.poke(false.B) // clear_w 핀의 전기를 끕니다.
 
-//       // ----------------------------------------------------
-//       // [2단계] Weight 장전: Weight 레지스터에 5를 넣습니다.
-//       // ----------------------------------------------------
-//       dut.io.set_w.poke(true.B)
-//       dut.io.in_w.poke(5.U)
-//       dut.clock.step(1)            // 클럭이 뛰는 순간, weight 레지스터에 5가 들어갑니다.
-//       dut.io.set_w.poke(false.B)   // 장전 끝
+      // ----------------------------------------------------
+      // [2단계] Weight 장전: Weight 레지스터에 5를 넣습니다.
+      // ----------------------------------------------------
+      dut.io.set_w.poke(true.B)
+      dut.io.in_w.poke(5.U)
+      dut.clock.step(1)            // 클럭이 뛰는 순간, weight 레지스터에 5가 들어갑니다.
+      dut.io.set_w.poke(false.B)   // 장전 끝
 
-//       // ----------------------------------------------------
-//       // [3단계] 연산 테스트 1 (클럭 없이 즉시 계산되는 조합 로직)
-//       // ----------------------------------------------------
-//       // 입력: A = 2, 위에서 내려오는 부분합 C = 10
-//       dut.io.in_a.poke(2.U)
-//       dut.io.in_c.poke(10.U)
+      // ----------------------------------------------------
+      // [3단계] 연산 테스트 1 (클럭 없이 즉시 계산되는 조합 로직)
+      // ----------------------------------------------------
+      // 입력: A = 2, 위에서 내려오는 부분합 C = 10
+      dut.io.in_a.poke(2.U)
+      dut.io.in_c.poke(10.U)
+      dut.clock.step(1)
 
-//       // 예상: (A * W) + C = (2 * 5) + 10 = 20
-//       // MAC 연산과 in_a 통과 로직은 레지스터(순차 로직)를 거치지 않는 '조합 로직'이므로, 
-//       // 클럭(step)을 뛰게 하지 않아도 poke 하자마자 전기가 흘러서 바로 결과를 알 수 있습니다.
-//       dut.io.out_mac.expect(20.U) 
-//       dut.io.out_in.expect(2.U)   // A값(2)이 오른쪽으로 잘 넘어가는지도 확인
+      // 예상: (A * W) + C = (2 * 5) + 10 = 20
+      // MAC 연산과 in_a 통과 로직은 레지스터(순차 로직)를 거치지 않는 '조합 로직'이므로, 
+      // 클럭(step)을 뛰게 하지 않아도 poke 하자마자 전기가 흘러서 바로 결과를 알 수 있습니다.
+      dut.io.out_mac.expect(20.U) 
+      dut.io.out_in.expect(2.U)   // A값(2)이 오른쪽으로 잘 넘어가는지도 확인
 
-//       dut.clock.step(1) // 다음 테스트를 위해 1클럭 넘김
+      dut.clock.step(1) // 다음 테스트를 위해 1클럭 넘김
 
-//       // ----------------------------------------------------
-//       // [4단계] 연산 테스트 2
-//       // ----------------------------------------------------
-//       // 입력: A = 3, 위에서 내려오는 부분합 C = 0
-//       dut.io.in_a.poke(3.U)
-//       dut.io.in_c.poke(0.U)
+      // ----------------------------------------------------
+      // [4단계] 연산 테스트 2
+      // ----------------------------------------------------
+      // 입력: A = 3, 위에서 내려오는 부분합 C = 0
+      dut.io.in_a.poke(3.U)
+      dut.io.in_c.poke(0.U)
+      dut.clock.step(1)
 
-//       // 예상: (3 * 5) + 0 = 15 (Weight 5는 계속 유지되어야 함)
-//       dut.io.out_mac.expect(15.U)
-//       dut.io.out_in.expect(3.U)
-//     }
-//   }
-// }
+      // 예상: (3 * 5) + 0 = 15 (Weight 5는 계속 유지되어야 함)
+      dut.io.out_mac.expect(15.U)
+      dut.io.out_in.expect(3.U)
+    }
+  }
+}
 
 class MatMulUnit_16Test extends AnyFlatSpec with ChiselScalatestTester {
   behavior of "MatMulUnit_16"
