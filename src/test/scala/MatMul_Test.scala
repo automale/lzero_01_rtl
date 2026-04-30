@@ -104,7 +104,7 @@ class MatMulUnit_16Test extends AnyFlatSpec with ChiselScalatestTester {
 
       // mat A skewed input
       val total_cycles = 50
-      val actual_output = Array.fill(total_cycles, 16)(0)
+      val actual_output = Array.fill(16)(0)
       val latency = 16
       for ( t <- 0 until total_cycles ){
         // feeding input
@@ -114,31 +114,21 @@ class MatMulUnit_16Test extends AnyFlatSpec with ChiselScalatestTester {
         }
         // validating
         for ( c <- 0 until 16 ){
+          actual_output(c) = dut.io.out_MAC(c).peek().litValue.toInt
+
           if (t >= latency && t < latency + 31) {
             val time_index = t - latency
             dut.io.out_MAC(c).expect( expected_output(time_index)(c).U )
-            actual_output(time_index)(c) = dut.io.out_MAC(c).peek().litValue.toInt
           } 
           else {
             // 유효한 데이터가 안 나올 타이밍(Bubble)에는 0이 나오는지 깐깐하게 검사합니다.
             dut.io.out_MAC(c).expect(0.U)
           }
         }
+        val str = actual_output.mkString("\t")
+        println(s"Clock $t : \t $str")
         dut.clock.step(1)
       }
-
-      // print out skewed matrix
-      println("===== Skewed Output =====")
-      for ( t <- 0 until 31 ) {
-        // 결과가 0이 아닐 때만 출력해 보면, 대각선으로 데이터가 흘러나오는 장관을 볼 수 있습니다.
-        val row_data = actual_output(t)  
-        if (row_data.exists(_ != 0)) {
-          val str = row_data.mkString("\t")
-          val clock_ = t + latency
-          println(s"Clock $clock_ : \t $str")
-        }
-      }
-
     }
   }
 }
