@@ -134,7 +134,7 @@ class DataOrchUnit_16 extends Module {
 
 // [4] Chisel 6.x 문법에 맞춘 실행 객체
 object TPU_Main extends App {
-  println("🚀 L-ZERO Accelerator의 SystemVerilog 도면을 추출합니다...")
+  println("TPU Accelerator SystemVerilog extracting...")
   
   // 1. 가장 작은 세포 (선택사항)
   ChiselStage.emitSystemVerilogFile(new MacUnit(), Array("--target-dir", "generated"))
@@ -145,5 +145,5 @@ object TPU_Main extends App {
   // 3. 16x16 데이터 오케스트레이터
   ChiselStage.emitSystemVerilogFile(new DataOrchUnit_16(), Array("--target-dir", "generated"))
   
-  println("✅ 모든 도면 생성 완료! 'generated' 폴더를 확인하십시오.")
+  println("Extract SV Finished! Please check 'generated' directory")
 }
