@@ -104,7 +104,7 @@ class MatMulUnit_16Test extends AnyFlatSpec with ChiselScalatestTester {
 
       // mat A skewed input
       val total_cycles = 50
-      val actual_output = Array.fill(16)(0)
+      val actual_output = Array.fill(50, 16)(0)
       val latency = 16
       for ( t <- 0 until total_cycles ){
         // feeding input
@@ -114,7 +114,7 @@ class MatMulUnit_16Test extends AnyFlatSpec with ChiselScalatestTester {
         }
         // validating
         for ( c <- 0 until 16 ){
-          actual_output(c) = dut.io.out_MAC(c).peek().litValue.toInt
+          actual_output(t)(c) = dut.io.out_MAC(c).peek().litValue.toInt
 
           if (t >= latency && t < latency + 31) {
             val time_index = t - latency
@@ -125,9 +125,13 @@ class MatMulUnit_16Test extends AnyFlatSpec with ChiselScalatestTester {
             dut.io.out_MAC(c).expect(0.U)
           }
         }
-        val str = actual_output.mkString("\t")
-        println(s"Clock $t : \t $str")
         dut.clock.step(1)
+      }
+      println("+++++ Ouput +++++")
+      for ( t <- 0 until total_cycles ){
+        val idx = total_cycles - 1 - t
+        val str = actual_output(idx).mkString("\t")
+        println(s"Clock $idx : \t $str")
       }
     }
   }
