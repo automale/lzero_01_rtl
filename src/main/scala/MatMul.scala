@@ -32,7 +32,7 @@ class MacUnit extends Module {
 }
 
 // [2] systolic array 16 by 16
-class MatMulUnit_16 extends Module {
+class MXU_16 extends Module {
   // input output
   val io = IO(new Bundle{
     val in_X    = Input(Vec(16, UInt(8.W)))
@@ -165,7 +165,7 @@ class DataOrchUnit_16 extends Module {
     // mxu input wiring
     io.mxu_input(r) := input_buff(r).io.out_scalar
     // shadow weight buffer to output wiring 
-    // ** will be wired to MatMulUnit_16's in_W
+    // ** will be wired to MXU_16's in_W
     for (c <- 0 until 16) {
       io.mxu_weight(r)(c) := shadow_weight_buff(r).io.out_vector(c)
     }
@@ -191,7 +191,7 @@ class TPU_top extends Module {
 
   // module instantiation
   val orchestrator = Module(new DataOrchUnit_16())
-  val mxu          = Module(new MatMulUnit_16())
+  val mxu          = Module(new MXU_16())
 
   
   // [A] outer IO <-> Orchestrator
@@ -223,7 +223,7 @@ object TPU_Main extends App {
   
   // [수정] 오타(.t_16) 제거 및 최상위 Wrapper(TPU_top) SV 추출 추가!
   ChiselStage.emitSystemVerilogFile(new MacUnit(), Array("--target-dir", "generated"))
-  ChiselStage.emitSystemVerilogFile(new MatMulUnit_16(), Array("--target-dir", "generated"))
+  ChiselStage.emitSystemVerilogFile(new MXU_16(), Array("--target-dir", "generated"))
   ChiselStage.emitSystemVerilogFile(new DataOrchUnit_16(), Array("--target-dir", "generated"))
   ChiselStage.emitSystemVerilogFile(new TPU_top(), Array("--target-dir", "generated"))
   
