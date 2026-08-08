@@ -36,32 +36,86 @@ class OcmCommonIo extends Bundle {
   val working            = Output(Bool())
 }
 
-// 공통 핑퐁 SRAM 인스턴스 (True Dual-Port 모사)
-class PingPongSRAM(val depth: Int = 256, val width: Int = 128) extends Module {
-  val io = IO(new Bundle {
-    val ping_wr_en   = Input(Bool())
-    val ping_wr_addr = Input(UInt(log2Ceil(depth).W))
-    val ping_wr_data = Input(UInt(width.W))
-    val ping_rd_en   = Input(Bool())
-    val ping_rd_addr = Input(UInt(log2Ceil(depth).W))
-    val ping_rd_data = Output(UInt(width.W))
-
-    val pong_wr_en   = Input(Bool())
-    val pong_wr_addr = Input(UInt(log2Ceil(depth).W))
-    val pong_wr_data = Input(UInt(width.W))
-    val pong_rd_en   = Input(Bool())
-    val pong_rd_addr = Input(UInt(log2Ceil(depth).W))
-    val pong_rd_data = Output(UInt(width.W))
-  })
+// ====================================================================
+// [1] 비대칭 대역폭 Ping-Pong SRAM (64B Write / 16B Read)
+// ====================================================================
+class AsymmetricPingPongSRAM(
+  val writeWidthBytes: Int = 64, // DMA Write: 64 Byte (512-bit) / cycle
+  val readWidthBytes: Int = 16,  // CU Read: 16 Byte (128-bit) / cycle
+  val capacityBytes: Int = 4096  // Bank당 용량: 4 KB
+) extends Module {
   
-  val ping_bank = SyncReadMem(depth, UInt(width.W))
-  val pong_bank = SyncReadMem(depth, UInt(width.W))
+  val writeWidth = writeWidthBytes * 8 // 512 bits
+  val readWidth  = readWidthBytes * 8  // 128 bits
+  
+  // 대역폭 비율 (Ratio) = 4
+  val ratio = writeWidth / readWidth 
+  
+  // 깊이(Depth) 계산
+  val writeDepth = capacityBytes / writeWidthBytes // 64 (0 ~ 63)
+  val readDepth  = capacityBytes / readWidthBytes  // 256 (0 ~ 255)
 
-  when(io.ping_wr_en) { ping_bank.write(io.ping_wr_addr, io.ping_wr_data) }
-  io.ping_rd_data := ping_bank.read(io.ping_rd_addr, io.ping_rd_en)
+  val io = IO(new Bundle {
+    // ----------------------------------------------------
+    // Ping Bank Ports
+    // ----------------------------------------------------
+    val ping_wr_en   = Input(Bool())
+    val ping_wr_addr = Input(UInt(log2Ceil(writeDepth).W)) // 6 bits
+    val ping_wr_data = Input(UInt(writeWidth.W))           // 512 bits
+    
+    val ping_rd_en   = Input(Bool())
+    val ping_rd_addr = Input(UInt(log2Ceil(readDepth).W))  // 8 bits
+    val ping_rd_data = Output(UInt(readWidth.W))           // 128 bits
 
-  when(io.pong_wr_en) { pong_bank.write(io.pong_wr_addr, io.pong_wr_data) }
-  io.pong_rd_data := pong_bank.read(io.pong_rd_addr, io.pong_rd_en)
+    // ----------------------------------------------------
+    // Pong Bank Ports
+    // ----------------------------------------------------
+    val pong_wr_en   = Input(Bool())
+    val pong_wr_addr = Input(UInt(log2Ceil(writeDepth).W)) // 6 bits
+    val pong_wr_data = Input(UInt(writeWidth.W))           // 512 bits
+    
+    val pong_rd_en   = Input(Bool())
+    val pong_rd_addr = Input(UInt(log2Ceil(readDepth).W))  // 8 bits
+    val pong_rd_data = Output(UInt(readWidth.W))           // 128 bits
+  })
+
+  // ----------------------------------------------------------------
+  // Helper Method: 서브 뱅크 생성 및 라우팅 로직
+  // ----------------------------------------------------------------
+  def buildAsymmetricBank(
+    wr_en: Bool, wr_addr: UInt, wr_data: UInt,
+    rd_en: Bool, rd_addr: UInt
+  ): UInt = {
+    // 4개의 서브 뱅크(SyncReadMem) 생성: 각각 128-bit 너비, 깊이 64
+    val sub_banks = Seq.fill(ratio)(SyncReadMem(writeDepth, UInt(readWidth.W)))
+    val rd_data_vec = Wire(Vec(ratio, UInt(readWidth.W)))
+
+    // 상위 비트: 서브 뱅크의 공통 어드레스 (rd_addr >> 2)
+    val word_addr = rd_addr(log2Ceil(readDepth) - 1, log2Ceil(ratio)) 
+    
+    for (i <- 0 until ratio) {
+      // Write: 512-bit 데이터를 128-bit씩 4조각으로 잘라서 4개 뱅크에 동시에 씀
+      val slice_data = wr_data((i + 1) * readWidth - 1, i * readWidth)
+      when(wr_en) {
+        sub_banks(i).write(wr_addr, slice_data)
+      }
+      // Read: 공통 word_addr를 주고 데이터를 읽어옴 (1클럭 지연 발생)
+      rd_data_vec(i) := sub_banks(i).read(word_addr, rd_en)
+    }
+
+    // 하위 비트: 4개의 서브 뱅크 중 어떤 것을 선택할지 결정 (rd_addr의 LSB 2 bits)
+    val bank_sel = rd_addr(log2Ceil(ratio) - 1, 0)
+    
+    // SyncReadMem은 1클럭 딜레이가 있으므로, 선택 신호(bank_sel)도 똑같이 1클럭 지연시킴
+    val bank_sel_d1 = RegEnable(bank_sel, 0.U, rd_en)
+
+    // 최종 128-bit 데이터 출력 MUX
+    rd_data_vec(bank_sel_d1)
+  }
+
+  // 인스턴스화 및 포트 연결
+  io.ping_rd_data := buildAsymmetricBank(io.ping_wr_en, io.ping_wr_addr, io.ping_wr_data, io.ping_rd_en, io.ping_rd_addr)
+  io.pong_rd_data := buildAsymmetricBank(io.pong_wr_en, io.pong_wr_addr, io.pong_wr_data, io.pong_rd_en, io.pong_rd_addr)
 }
 
 // ====================================================================
