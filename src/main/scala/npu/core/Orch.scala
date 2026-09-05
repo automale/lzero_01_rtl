@@ -1,151 +1,329 @@
 package npu.core
+
 import chisel3._
 import chisel3.util._
 
-// [1] data orchestrator를 위한 shift buffer
-class Orch_inbuffer (
-  val vectorSize: Int, // 16 
-  val dataBits: Int    // 8
-) extends Module {
-  val io = IO(new Bundle{
-    val in_vector   = Input(Vec(vectorSize, UInt(dataBits.W)))
-    val load_enable = Input(Bool())
-    val shft_enable = Input(Bool())
-    
-    val stall       = Input(Bool()) // 파이프라인 정지 신호
-    
-    val out_scalar  = Output(UInt(dataBits.W))
-    val orch_alert  = Output(Bool()) 
-  })
-  
-  val run = !io.stall
-  val shift_reg = RegInit(VecInit(Seq.fill(vectorSize)(0.U(dataBits.W))))
 
-  // [1] Shift Register State Update Logic
-  when (run) {
-    when (io.load_enable && io.shft_enable) {
-      // [의도 반영] Load와 Shift 동시 발생: 0번째는 즉시 방출되므로 1번째부터 레지스터에 담음
-      for (i <- 0 until vectorSize - 1) {
-        shift_reg(i) := io.in_vector(i+1)
+// ============================================================================
+// [1] One lane of input skew
+//
+// lane k -> k-cycle delay
+//
+// data, valid, weight_update tag all experience identical timing.
+// ============================================================================
+class InputSkewLane(
+  val delayCycles: Int,
+  val dataBits: Int = 8
+) extends Module {
+
+  require(delayCycles >= 0)
+
+  val io = IO(new Bundle {
+    val in_data =
+      Input(SInt(dataBits.W))
+
+    val in_valid =
+      Input(Bool())
+
+    val in_tile_start =
+      Input(Bool())
+
+    val stall =
+      Input(Bool())
+
+    val out_data =
+      Output(SInt(dataBits.W))
+
+    val out_valid =
+      Output(Bool())
+
+    val out_weight_update =
+      Output(Bool())
+  })
+
+  val run = !io.stall
+
+  if (delayCycles == 0) {
+
+    io.out_data :=
+      Mux(
+        run && io.in_valid,
+        io.in_data,
+        0.S(dataBits.W)
+      )
+
+    io.out_valid :=
+      run && io.in_valid
+
+    io.out_weight_update :=
+      run &&
+      io.in_valid &&
+      io.in_tile_start
+
+  } else {
+
+    val dataPipe =
+      RegInit(
+        VecInit(
+          Seq.fill(delayCycles)(
+            0.S(dataBits.W)
+          )
+        )
+      )
+
+    val validPipe =
+      RegInit(
+        VecInit(
+          Seq.fill(delayCycles)(
+            false.B
+          )
+        )
+      )
+
+    val updatePipe =
+      RegInit(
+        VecInit(
+          Seq.fill(delayCycles)(
+            false.B
+          )
+        )
+      )
+
+    when(run) {
+
+      dataPipe(0) :=
+        Mux(
+          io.in_valid,
+          io.in_data,
+          0.S(dataBits.W)
+        )
+
+      validPipe(0) :=
+        io.in_valid
+
+      updatePipe(0) :=
+        io.in_valid &&
+        io.in_tile_start
+
+      for (i <- 1 until delayCycles) {
+        dataPipe(i) :=
+          dataPipe(i - 1)
+
+        validPipe(i) :=
+          validPipe(i - 1)
+
+        updatePipe(i) :=
+          updatePipe(i - 1)
       }
-      shift_reg(vectorSize - 1) := 0.U
-      
-    } .elsewhen (io.load_enable) {
-      // 단순 Load: 벡터 전체를 레지스터에 온전히 담음
-      shift_reg := io.in_vector
-      
-    } .elsewhen (io.shft_enable) {
-      // 단순 Shift: 기존 레지스터 값들을 한 칸씩 이동
-      for (i <- 0 until vectorSize - 1) {
-        shift_reg(i) := shift_reg(i+1)
-      }
-      shift_reg(vectorSize - 1) := 0.U
     }
+
+    io.out_data :=
+      Mux(
+        run && validPipe(delayCycles - 1),
+        dataPipe(delayCycles - 1),
+        0.S(dataBits.W)
+      )
+
+    io.out_valid :=
+      run &&
+      validPipe(delayCycles - 1)
+
+    io.out_weight_update :=
+      run &&
+      updatePipe(delayCycles - 1)
   }
-
-  // [2] Output Combinational MUX Logic
-  // Load+Shift 동시 발생 시 -> in_vector(0)를 즉시 Bypass하여 방출
-  // Shift만 발생 시 -> shift_reg(0) 방출
-  // 그 외 -> 0.U 방출
-  val current_out = Mux(io.load_enable && io.shft_enable, io.in_vector(0),
-                      Mux(io.shft_enable, shift_reg(0), 
-                      0.U(dataBits.W)))
-
-  // Stall 시에는 방출을 막아 하위 MAC Unit의 불필요한 연산(토글) 방지
-  io.out_scalar := Mux(run, current_out, 0.U(dataBits.W))
-  
-  // [3] Debug Alert
-  io.orch_alert := false.B
 }
 
-// [2] data orchestrator를 위한 사이즈 16의 shadow weight buffer
-class Shadow_wbuffer(
-  val vectorSize: Int, // 16 
-  val dataBits: Int    // 8
-) extends Module {
-  val io = IO(new Bundle{
-    val in_vector   = Input(Vec(vectorSize, UInt(dataBits.W)))
-    val load_enable = Input(Bool())
-    val out_enable  = Input(Bool())
-    
-    val stall       = Input(Bool())
-    
-    val out_vector  = Output(Vec(vectorSize, UInt(dataBits.W)))
-    val orch_alert  = Output(Bool())
-  })
-  
-  val run = !io.stall
-  val shadow_weight_reg = RegInit(VecInit(Seq.fill(vectorSize)(0.U(dataBits.W))))
 
-  when ( run && io.load_enable ){
-    shadow_weight_reg := io.in_vector
-  } 
-  
-  io.out_vector := Mux(io.out_enable, shadow_weight_reg, VecInit(Seq.fill(16)(0.U(8.W))))
-
-  io.orch_alert := false.B
-}
-
-// [3] data orchestration unit
+// ============================================================================
+// [2] Data Orchestrator
+//
+// Input:
+//
+//   one INT8 A row / cycle
+//
+//       in_input(k) = A[m][k]
+//
+// Output:
+//
+//       lane k delayed by k cycles
+//
+//
+// Weight:
+//
+//   one INT8 W row / cycle
+//
+//       beat n = W[n][0:K-1]
+//
+// Shadow storage:
+//
+//       shadowWeight(n)(k) = W[n][k]
+//
+// MXU:
+//
+//       PE[k][n].shadow_w = W[n][k]
+// ============================================================================
 class DataOrchUnit(
-  val numRows: Int,  // 16
-  val numCols: Int,  // 16
-  val dataBits: Int, // 8
+  val numRows: Int = 16,
+  val numCols: Int = 16,
+  val dataBits: Int = 8
 ) extends Module {
-  val io = IO(new Bundle{
-    val in_input    = Input(Vec(numCols, UInt(dataBits.W)))
-    val in_weight   = Input(Vec(numCols, UInt(dataBits.W)))
 
-    val feed_enable = Input(Bool())
-    val load_enable = Input(Bool())
-    
-    val stall       = Input(Bool())
+  require(numRows > 0)
+  require(numCols > 0)
 
-    val mxu_input   = Output(Vec(numRows, UInt(dataBits.W)))
-    val mxu_weight  = Output(Vec(numRows, Vec(numCols, UInt(dataBits.W))))
-    val feed_row    = Output(Vec(numRows, Bool()))
-    
-    val orch_alert  = Output(Bool())
+  val io = IO(new Bundle {
+
+    // A[m][0:K-1]
+    val in_input =
+      Input(Vec(numRows, SInt(dataBits.W)))
+
+    val input_valid =
+      Input(Bool())
+
+    // Asserted only for the first A row of a new tile
+    val input_tile_start =
+      Input(Bool())
+
+    // W[n][0:K-1]
+    val in_weight =
+      Input(Vec(numRows, SInt(dataBits.W)))
+
+    val weight_valid =
+      Input(Bool())
+
+    val stall =
+      Input(Bool())
+
+    // To MXU
+    val mxu_input =
+      Output(Vec(numRows, SInt(dataBits.W)))
+
+    val mxu_input_valid =
+      Output(Vec(numRows, Bool()))
+
+    // mxu_weight(k)(n) = W[n][k]
+    val mxu_weight =
+      Output(
+        Vec(
+          numRows,
+          Vec(numCols, SInt(dataBits.W))
+        )
+      )
+
+    val weight_update_row =
+      Output(Vec(numRows, Bool()))
+
+    val orch_alert =
+      Output(Bool())
   })
 
   val run = !io.stall
 
-  val input_buff         = Seq.fill(numRows)(Module(new Orch_inbuffer(numCols, dataBits)))
-  val shadow_weight_buff = Seq.fill(numRows)(Module(new Shadow_wbuffer(numCols, dataBits)))
-  
-  val control_chain = RegInit(VecInit(Seq.fill(numRows)(false.B)))
+  // ==========================================================================
+  // Input skew
+  // ==========================================================================
 
-  // control chain wiring
-  when (run) {
-    control_chain(0) := io.feed_enable
-    for (r <- 1 until numRows) {
-      control_chain(r) := control_chain(r-1)
+  val skewLanes =
+    Seq.tabulate(numRows) { k =>
+      Module(
+        new InputSkewLane(
+          delayCycles = k,
+          dataBits = dataBits
+        )
+      )
+    }
+
+  for (k <- 0 until numRows) {
+
+    val lane =
+      skewLanes(k)
+
+    lane.io.in_data :=
+      io.in_input(k)
+
+    lane.io.in_valid :=
+      io.input_valid
+
+    lane.io.in_tile_start :=
+      io.input_tile_start
+
+    lane.io.stall :=
+      io.stall
+
+    io.mxu_input(k) :=
+      lane.io.out_data
+
+    io.mxu_input_valid(k) :=
+      lane.io.out_valid
+
+    io.weight_update_row(k) :=
+      lane.io.out_weight_update
+  }
+
+  // ==========================================================================
+  // Shadow Weight
+  //
+  // first index  : N / MXU column
+  // second index : K / MXU row
+  //
+  // shadowWeight(n)(k) = W[n][k]
+  // ==========================================================================
+
+  val shadowWeight =
+    RegInit(
+      VecInit(
+        Seq.fill(numCols)(
+          VecInit(
+            Seq.fill(numRows)(
+              0.S(dataBits.W)
+            )
+          )
+        )
+      )
+    )
+
+  val weightIdxBits =
+    math.max(
+      1,
+      log2Ceil(numCols)
+    )
+
+  val weightLoadIdx =
+    RegInit(
+      0.U(weightIdxBits.W)
+    )
+
+  when(run && io.weight_valid) {
+
+    shadowWeight(weightLoadIdx) :=
+      io.in_weight
+
+    when(
+      weightLoadIdx ===
+      (numCols - 1).U
+    ) {
+      weightLoadIdx := 0.U
+    }.otherwise {
+      weightLoadIdx :=
+        weightLoadIdx + 1.U
     }
   }
 
-  for(r <- 0 until numRows) {
-    // 1. Data Irrigation (BRAM -> Buffer)
-    input_buff(r).io.in_vector := io.in_input
-    shadow_weight_buff(r).io.in_vector := io.in_weight
+  // ==========================================================================
+  // Shadow -> MXU mapping
+  //
+  // PE[k][n] requires W[n][k]
+  // ==========================================================================
 
-    // 2. Control Wiring (Stall 및 파동 제어 신호 할당)
-    input_buff(r).io.stall       := io.stall
-    input_buff(r).io.shft_enable := control_chain(r)
-    input_buff(r).io.load_enable := control_chain(r) && io.load_enable
-    
-    shadow_weight_buff(r).io.stall       := io.stall
-    shadow_weight_buff(r).io.out_enable  := control_chain(r)
-    shadow_weight_buff(r).io.load_enable := control_chain(r) && io.load_enable
+  for (k <- 0 until numRows) {
+    for (n <- 0 until numCols) {
 
-    // 3. Output Wiring (Buffer -> MXU)
-    io.feed_row(r)  := control_chain(r)
-    io.mxu_input(r) := input_buff(r).io.out_scalar
-    io.mxu_weight(r):= shadow_weight_buff(r).io.out_vector
+      io.mxu_weight(k)(n) :=
+        shadowWeight(n)(k)
+    }
   }
 
-  // [debug] Aggregation
-  val in_alerts = input_buff.map(_.io.orch_alert)
-  val w_alerts  = shadow_weight_buff.map(_.io.orch_alert)
-  
-  io.orch_alert := VecInit(in_alerts ++ w_alerts).asUInt.orR
+  io.orch_alert :=
+    false.B
 }

@@ -1,150 +1,387 @@
 package npu.core
+
 import chisel3._
 import chisel3.util._
 
-// [1] Accumulation Shift Buffer for Tile Accumulation
+
+// ============================================================================
+// [1] Per-column accumulation buffer
+//
+// One Accum_buffer corresponds to one output column N.
+//
+// Input       : signed INT32 MXU partial sum
+// Accumulator : signed INT32
+//
+// For every K tile:
+//
+//   row0, row1, ..., row15
+//
+// are streamed into this buffer.
+//
+// ping_reg:
+//   working K-tile accumulation
+//
+// pong_reg:
+//   completed output tile snapshot
+// ============================================================================
 class Accum_buffer(
-  val numLines: Int, // 16
-  val inBits: Int,   // 16
-  val outBits: Int   // 32
+  val numLines: Int = 16,
+  val dataBits: Int = 32
 ) extends Module {
-  val io = IO(new Bundle{
-    val in_scalar   = Input(UInt(inBits.W))
-    val accum_en    = Input(Bool()) 
-    val first_tile  = Input(Bool()) 
-    val snapshot    = Input(Bool()) 
-    
-    val stall       = Input(Bool()) 
-    
-    val out_pong_array = Output(Vec(numLines, UInt(outBits.W)))
-    val accum_alert    = Output(Bool()) 
+
+  val io = IO(new Bundle {
+
+    val in_scalar =
+      Input(SInt(dataBits.W))
+
+    val accum_en =
+      Input(Bool())
+
+    val first_tile =
+      Input(Bool())
+
+    val snapshot =
+      Input(Bool())
+
+    val stall =
+      Input(Bool())
+
+    val out_pong_array =
+      Output(Vec(numLines, SInt(dataBits.W)))
+
+    val accum_alert =
+      Output(Bool())
   })
 
   val run = !io.stall
 
-  val ping_reg = RegInit(VecInit(Seq.fill(numLines)(0.U(outBits.W))))
-  val pong_reg = RegInit(VecInit(Seq.fill(numLines)(0.U(outBits.W))))
+  val ping_reg =
+    RegInit(
+      VecInit(
+        Seq.fill(numLines)(
+          0.S(dataBits.W)
+        )
+      )
+    )
 
-  // 새 값이 reg(15)로 들어가므로, 이전 누적값은 reg(0)에 도착해 있음
-  val addend           = Mux(io.first_tile, 0.U(outBits.W), ping_reg(0))
-  val current_sum_full = addend +& io.in_scalar
-  val current_sum      = current_sum_full(outBits - 1, 0)
-  val overflow         = current_sum_full(outBits)
+  val pong_reg =
+    RegInit(
+      VecInit(
+        Seq.fill(numLines)(
+          0.S(dataBits.W)
+        )
+      )
+    )
 
-  when (run) {
-    // =======================================================
-    // [PING]: 새 값을 reg(15)에 넣고, reg(0) 방향으로 시프트
-    // 16사이클 뒤: reg(0) = Row 0 ... reg(15) = Row 15
-    // =======================================================
-    when (io.accum_en) {
-      ping_reg(numLines - 1) := current_sum
+  // For first K tile:
+  //
+  //     result = 0 + MXU
+  //
+  // For following K tiles:
+  //
+  //     result = previous K accumulation + MXU
+  val addend =
+    Mux(
+      io.first_tile,
+      0.S(dataBits.W),
+      ping_reg(0)
+    )
+
+  // INT32 + INT32 -> INT33
+  val current_sum_full =
+    addend +& io.in_scalar
+
+  val current_sum =
+    current_sum_full(
+      dataBits - 1,
+      0
+    ).asSInt
+
+  val overflow =
+    current_sum_full(dataBits) =/=
+    current_sum_full(dataBits - 1)
+
+  when(run) {
+
+    // ------------------------------------------------------------------------
+    // Working accumulation
+    // ------------------------------------------------------------------------
+    when(io.accum_en) {
+
+      ping_reg(numLines - 1) :=
+        current_sum
+
       for (i <- 0 until numLines - 1) {
-        ping_reg(i) := ping_reg(i + 1)
+        ping_reg(i) :=
+          ping_reg(i + 1)
       }
     }
 
-    // =======================================================
-    // [PONG]: 정렬된 상태 그대로 스냅샷 복사
-    // =======================================================
-    when (io.snapshot && io.accum_en) {
-      pong_reg(numLines - 1) := current_sum
+    // ------------------------------------------------------------------------
+    // Final tile snapshot
+    //
+    // At the last row:
+    //
+    // ping(1..15) already contain final rows 0..14
+    // current_sum contains final row 15
+    // ------------------------------------------------------------------------
+    when(io.snapshot && io.accum_en) {
+
+      pong_reg(numLines - 1) :=
+        current_sum
+
       for (i <- 0 until numLines - 1) {
-        pong_reg(i) := ping_reg(i + 1)
+        pong_reg(i) :=
+          ping_reg(i + 1)
       }
     }
   }
-  
-  io.out_pong_array := pong_reg
-  io.accum_alert := io.accum_en && overflow && run
+
+  io.out_pong_array :=
+    pong_reg
+
+  io.accum_alert :=
+    run &&
+    io.accum_en &&
+    overflow
 }
 
-// [2] 16x16 2D 타일 누산기 (Ping-Pong & De-skew 기능 탑재)
-class TileAccumulator(
-  val numCols: Int,  // 16
-  val numLines: Int, // 16
-  val inBits: Int,   // 16
-  val outBits: Int   // 32
-) extends Module {
-  val io = IO(new Bundle {
-    // 1. TPU MXU vector input (Skewed)
-    val in_vec          = Input(Vec(numCols, UInt(inBits.W))) 
-    
-    // 2. Skewed Control Signals (FSM에서 0번 Col에 인가)
-    val accum_en        = Input(Bool()) // 누적 진행
-    val accum_first     = Input(Bool()) // K-차원 첫 타일 여부
-    val accum_snapshot  = Input(Bool()) // 타일 완료 스냅샷 펄스
-    
-    // 3. Flat Control Signal (VPU 배출용 브로드캐스트)
-    val accum_stream_en = Input(Bool()) // 16사이클 동안 1 유지
-    
-    val stall           = Input(Bool()) 
 
-    // 4. Output for VPU (Flat & Row-Major)
-    val out_vec         = Output(Vec(numCols, UInt(outBits.W)))
-    val out_valid       = Output(Vec(numCols, Bool())) 
-    
-    val accum_alert     = Output(Bool())
+// ============================================================================
+// [2] Tile Accumulator
+//
+// MXU output is skewed across N columns.
+//
+// If column 0 result arrives at t:
+//
+//   col0 : t
+//   col1 : t+1
+//   ...
+//   col15: t+15
+//
+// Therefore accumulation control must have exactly the same skew.
+//
+// IMPORTANT:
+//
+//   col0 control delay = 0
+//
+// not 1 cycle.
+// ============================================================================
+class TileAccumulator(
+  val numCols: Int = 16,
+  val numLines: Int = 16,
+  val dataBits: Int = 32
+) extends Module {
+
+  val io = IO(new Bundle {
+
+    val in_vec =
+      Input(
+        Vec(
+          numCols,
+          SInt(dataBits.W)
+        )
+      )
+
+    // Controls referenced to MXU output column 0
+    val accum_en =
+      Input(Bool())
+
+    val accum_first =
+      Input(Bool())
+
+    val accum_snapshot =
+      Input(Bool())
+
+    val accum_stream_en =
+      Input(Bool())
+
+    val stall =
+      Input(Bool())
+
+    val out_vec =
+      Output(
+        Vec(
+          numCols,
+          SInt(dataBits.W)
+        )
+      )
+
+    val out_valid =
+      Output(
+        Vec(
+          numCols,
+          Bool()
+        )
+      )
+
+    val accum_alert =
+      Output(Bool())
   })
 
   val run = !io.stall
-  val accum_buffer = Seq.fill(numCols)(Module(new Accum_buffer(
-    numLines = numLines, 
-    inBits = inBits, 
-    outBits = outBits)))
 
-  // ====================================================================
-  // [1] Skewed Delay Chains (TPU 출력 타이밍 동기화)
-  // ====================================================================
-  val en_delay       = RegInit(VecInit(Seq.fill(numCols)(false.B))) 
-  val first_delay    = RegInit(VecInit(Seq.fill(numCols)(false.B))) 
-  val snapshot_delay = RegInit(VecInit(Seq.fill(numCols)(false.B))) 
+  val accum_buffer =
+    Seq.fill(numCols)(
+      Module(
+        new Accum_buffer(
+          numLines = numLines,
+          dataBits = dataBits
+        )
+      )
+    )
 
-  when (run) {
-    en_delay(0)       := io.accum_en
-    first_delay(0)    := io.accum_first
-    snapshot_delay(0) := io.accum_snapshot
-    
-    for (c <- 1 until numCols) {
-      en_delay(c)       := en_delay(c-1)
-      first_delay(c)    := first_delay(c-1)
-      snapshot_delay(c) := snapshot_delay(c-1)
-    }
+  // ==========================================================================
+  // [A] Exact column skew of control signals
+  //
+  // col0 : direct
+  // col1 : 1-cycle delay
+  // ...
+  // ==========================================================================
+
+  val accumEnByCol =
+    Wire(Vec(numCols, Bool()))
+
+  val firstByCol =
+    Wire(Vec(numCols, Bool()))
+
+  val snapshotByCol =
+    Wire(Vec(numCols, Bool()))
+
+
+  accumEnByCol(0) :=
+    io.accum_en
+
+  firstByCol(0) :=
+    io.accum_first
+
+  snapshotByCol(0) :=
+    io.accum_snapshot
+
+
+  for (c <- 1 until numCols) {
+
+    accumEnByCol(c) :=
+      RegEnable(
+        accumEnByCol(c - 1),
+        false.B,
+        run
+      )
+
+    firstByCol(c) :=
+      RegEnable(
+        firstByCol(c - 1),
+        false.B,
+        run
+      )
+
+    snapshotByCol(c) :=
+      RegEnable(
+        snapshotByCol(c - 1),
+        false.B,
+        run
+      )
   }
 
-  // ====================================================================
-  // [2] Accumulator 입력 맵핑
-  // ====================================================================
-  for(c <- 0 until numCols) {
-    accum_buffer(c).io.in_scalar  := io.in_vec(c)
-    accum_buffer(c).io.accum_en   := en_delay(c)
-    accum_buffer(c).io.first_tile := first_delay(c)
-    accum_buffer(c).io.snapshot   := snapshot_delay(c)
-    accum_buffer(c).io.stall      := io.stall
-  }
 
-  // ====================================================================
-  // [3] Corner-Turning / De-skewing MUX 로직
-  // ====================================================================
-  // stream_en이 켜지면 0번 Row부터 15번 Row까지 순차적으로 인덱스를 증가시킴
-  val read_ptr = RegInit(0.U(log2Ceil(numLines).W))
-  
-  when (run) {
-    when (io.accum_stream_en) {
-      read_ptr := read_ptr + 1.U
-    } .otherwise {
-      read_ptr := 0.U
-    }
-  }
+  // ==========================================================================
+  // [B] MXU -> accumulation buffers
+  // ==========================================================================
 
-  // 16개 버퍼 배열에서 동일한 read_ptr 층(Row)을 횡단하며 긁어옴
   for (c <- 0 until numCols) {
-    io.out_vec(c)   := Mux(io.accum_stream_en && run, accum_buffer(c).io.out_pong_array(read_ptr), 0.U)
-    io.out_valid(c) := io.accum_stream_en && run
+
+    accum_buffer(c).io.in_scalar :=
+      io.in_vec(c)
+
+    accum_buffer(c).io.accum_en :=
+      accumEnByCol(c)
+
+    accum_buffer(c).io.first_tile :=
+      firstByCol(c)
+
+    accum_buffer(c).io.snapshot :=
+      snapshotByCol(c)
+
+    accum_buffer(c).io.stall :=
+      io.stall
   }
 
-  // ====================================================================
-  // [4] 에러 신호 통합
-  // ====================================================================
-  val all_alerts = accum_buffer.map(_.io.accum_alert)
-  io.accum_alert := VecInit(all_alerts).asUInt.orR
+
+  // ==========================================================================
+  // [C] Flat row-major output
+  //
+  // Read the same M-row from all N-column pong buffers.
+  //
+  // cycle 0:
+  //   Y[0][0:15]
+  //
+  // cycle 1:
+  //   Y[1][0:15]
+  //
+  // ...
+  // ==========================================================================
+
+  val readPtrBits =
+    math.max(
+      1,
+      log2Ceil(numLines)
+    )
+
+  val read_ptr =
+    RegInit(
+      0.U(readPtrBits.W)
+    )
+
+  when(run) {
+
+    when(io.accum_stream_en) {
+
+      when(
+        read_ptr ===
+        (numLines - 1).U
+      ) {
+
+        read_ptr :=
+          0.U
+
+      }.otherwise {
+
+        read_ptr :=
+          read_ptr + 1.U
+      }
+
+    }.otherwise {
+
+      read_ptr :=
+        0.U
+    }
+  }
+
+
+  for (c <- 0 until numCols) {
+
+    io.out_vec(c) :=
+      Mux(
+        io.accum_stream_en && run,
+        accum_buffer(c)
+          .io
+          .out_pong_array(read_ptr),
+        0.S(dataBits.W)
+      )
+
+    io.out_valid(c) :=
+      io.accum_stream_en &&
+      run
+  }
+
+
+  val allAlerts =
+    accum_buffer.map(
+      _.io.accum_alert
+    )
+
+  io.accum_alert :=
+    VecInit(allAlerts)
+      .asUInt
+      .orR
 }

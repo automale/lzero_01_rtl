@@ -31,6 +31,18 @@ gen:
 test:
 	docker exec -it lzero_rtl_env sbt test
 
+mxu-test:
+	docker exec -it lzero_rtl_env sbt \
+	  'set Compile / unmanagedSources ~= (_.filter(f => f.getName == "MXU.scala" || f.getName == "Orch.scala" || f.getName == "MxuOrchUnit.scala"))' \
+	  'set Test / unmanagedSources ~= (_.filter(_.getName == "MxuOrch_Test.scala"))' \
+	  'testOnly npu.core.MxuOrchUnitTest'
+
+tpu-test:
+	docker exec -it lzero_rtl_env sbt \
+	  'set Compile / unmanagedSources ~= (_.filter(f => f.getName == "MXU.scala" || f.getName == "Orch.scala" || f.getName == "Accum.scala" || f.getName == "TPU.scala"))' \
+	  'set Test / unmanagedSources ~= (_.filter(_.getName == "TPU_Test.scala"))' \
+	  'testOnly npu.top.TPUTopTest'
+
 # 5. 종료
 down:
 	docker compose down
