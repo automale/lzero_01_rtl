@@ -5,21 +5,60 @@ import chisel3.util._
 
 
 // ============================================================================
+// Dynamic metadata travelling with TPU output.
+//
+// Static VPU controls such as
+//
+//   alu_mode
+//   act_en
+//   norm_mode
+//   rope_en
+//
+// are NOT carried here.
+//
+// They remain constant for one macro-operation and should be held in
+// configuration registers.
+//
+// Only events whose meaning changes with the data stream are carried.
+// ============================================================================
+class TPUStreamMeta extends Bundle {
+
+  val param_update = Bool()
+
+  val fusion_change = Bool()
+
+  val norm_phase_change = Bool()
+  
+}
+
+
+// ============================================================================
 // Compute Timer
 //
-// Advances ONLY when row0_valid is high.
+// Logical datapath sequencer for TPU.
 //
-// row0_valid:
-//   one valid output row from MXU column 0
+// Timing reference:
 //
-// Every 16 accepted rows:
-//   one K tile has completed.
+//   MXU output column 0 valid
 //
-// Every intermNum K tiles:
-//   one output tile has completed.
+// The timer counts only actually accepted MXU output rows.
 //
-// Therefore the timer is naturally stall-safe:
-// if the datapath does not advance, row0_valid must not advance either.
+//                  row0_valid
+//                      │
+//                      ▼
+//               Row Counter (16)
+//                      │
+//                      ▼
+//               K Tile Counter
+//                      │
+//                      ▼
+//              Output Tile Event
+//                │      │      │
+//                ▼      ▼      ▼
+//            param   fusion   norm
+//
+// Accumulator physical column skew is NOT handled here.
+// That belongs to TileAccumulator.
 // ============================================================================
 class ComputeTimer(
   val tileSize: Int = 16
@@ -32,159 +71,245 @@ class ComputeTimer(
     // ------------------------------------------------------------------------
     // Datapath progress
     // ------------------------------------------------------------------------
+
     val row0_valid = Input(Bool())
-    // Number of K tiles accumulated into one output tile
+
+    val stall = Input(Bool())
+
+
+    // ------------------------------------------------------------------------
+    // Operation dimensions
+    //
+    // intermNum:
+    //   number of K tiles accumulated into one output tile
+    //
+    // colNum:
+    //   number of output-column tiles in one logical output row
+    // ------------------------------------------------------------------------
+
     val intermNum = Input(UInt(32.W))
-    // Number of output-column tiles in one logical row group
+
     val colNum = Input(UInt(32.W))
-    // Normalizer phase scheduling load value
+
     val norm_phase_load = Input(UInt(32.W))
 
 
     // ------------------------------------------------------------------------
-    // Accumulator control
+    // Accumulator logical control
     // ------------------------------------------------------------------------
-    // High during all 16 rows of the first K tile.
-    val accum_first = Output(Bool())
-    // One cycle pulse on every 16th accepted row.
-    val k_tile_done = Output(Bool())
-    // One cycle pulse on the last row of the final K tile.
+
+    // Level signal.
     //
-    // This can directly become accumulator snapshot for column 0.
+    // High while the current K tile is the first K tile.
+    val accum_first = Output(Bool())
+
+    // One-cycle event referenced to MXU column 0.
+    //
+    // High when:
+    //
+    //   final K tile
+    //   +
+    //   final row
+    //
+    // reaches MXU output column 0.
     val output_tile_done = Output(Bool())
 
 
     // ------------------------------------------------------------------------
-    // Tile metadata
+    // Dynamic metadata
     //
-    // These values describe the output tile currently being completed.
+    // Valid only together with output_tile_done.
     // ------------------------------------------------------------------------
+
     val param_update = Output(Bool())
+
     val fusion_change = Output(Bool())
+
     val norm_phase_change = Output(Bool())
   })
 
-  val rowBits = math.max( 1, log2Ceil(tileSize) )
+
+  val run = !io.stall
+
+  val fire = io.row0_valid && run
+
+
+  // ==========================================================================
+  // Safe configuration values
+  // ==========================================================================
+
+  val intermSafe =
+    Mux( io.intermNum === 0.U, 1.U, io.intermNum )
+
+  val colSafe = Mux( io.colNum === 0.U, 1.U, io.colNum )
+
 
   // ==========================================================================
   // Row counter
+  //
+  // Counts flat output rows from MXU column 0:
+  //
+  //   0 ... 15
   // ==========================================================================
+
+  val rowBits = math.max( 1, log2Ceil(tileSize) )
+
   val rowCounter = RegInit(0.U(rowBits.W))
 
 
   // ==========================================================================
-  // K-tile counter
+  // K tile counter
   //
   // 0 = first K tile
   // ==========================================================================
+
   val kTileCounter = RegInit(0.U(32.W))
 
 
   // ==========================================================================
   // Output-column tile counter
   //
-  // 0 means first output tile in the current row group.
+  // Used for parameter context change.
   //
-  // This corresponds naturally to param_update.
+  // 0 means:
+  //
+  //   first output-column tile of a logical output row
   // ==========================================================================
-  val colTileCounter =RegInit(0.U(32.W))
+  val colTileCounter = RegInit(0.U(32.W))
 
   // ==========================================================================
   // Fusion counter
   //
-  // Notion spec:
+  // Notion Compute Timer spec:
   //
-  //   start = 15
-  //   reload = 31
+  //   initial = 15
+  //   reload  = 31
   // ==========================================================================
   val fusionCounter = RegInit(15.U(32.W))
-
 
   // ==========================================================================
   // Normalizer phase counter
   //
-  // Notion spec:
-  //
-  //   start = 0
-  //   reload = norm_phase_load
+  // initial = 0
+  // reload  = norm_phase_load
   // ==========================================================================
   val normCounter = RegInit(0.U(32.W))
 
-  // Protect against illegal zero dimensions.
-  val intermSafe = Mux(io.intermNum === 0.U, 1.U, io.intermNum)
-
-  val colSafe = Mux(io.colNum === 0.U, 1.U, io.colNum)
-
   // ==========================================================================
-  // Current state flags
+  // Current logical state
   // ==========================================================================
-  io.accum_first := kTileCounter === 0.U
-
   val lastRow = rowCounter === (tileSize - 1).U
 
   val lastKTile = kTileCounter === (intermSafe - 1.U)
 
-  io.k_tile_done := io.row0_valid && lastRow
+  io.accum_first := kTileCounter === 0.U
 
-  io.output_tile_done := io.row0_valid && lastRow && lastKTile
+  val outputTileDone = fire && lastRow && lastKTile
 
-  // --------------------------------------------------------------------------
-  // Metadata describes the tile BEFORE counters advance.
-  // --------------------------------------------------------------------------
-  io.param_update := colTileCounter === 0.U
+  io.output_tile_done := outputTileDone
 
-  io.fusion_change := fusionCounter === 0.U
-
-  io.norm_phase_change := normCounter === 0.U
 
   // ==========================================================================
-  // State update
+  // Metadata
+  //
+  // Generate EVENT bits only when the corresponding output tile completes.
+  //
+  // These bits will later be queued until the accumulator starts streaming
+  // the de-skewed output tile.
   // ==========================================================================
-  when(io.row0_valid) {
+  io.param_update := outputTileDone && (colTileCounter === 0.U)
+
+  io.fusion_change := outputTileDone && (fusionCounter === 0.U)
+
+  io.norm_phase_change := outputTileDone && (normCounter === 0.U)
+
+  // ==========================================================================
+  // Counter update
+  // ==========================================================================
+
+  when(fire) {
+
+    // ------------------------------------------------------------------------
+    // One complete MXU output row accepted
+    // ------------------------------------------------------------------------
+
     when(lastRow) {
+
       rowCounter := 0.U
 
-      // ======================================================================
-      // K tile transition
-      // ======================================================================
+
+      // ----------------------------------------------------------------------
+      // One complete K tile accepted
+      // ----------------------------------------------------------------------
+
       when(lastKTile) {
+
+        // Next output tile begins from its first K tile.
         kTileCounter := 0.U
 
+
         // ====================================================================
-        // Completed one final output tile
+        // Completed one output tile.
         // ====================================================================
-        when( colTileCounter === (colSafe - 1.U) ) {
+
+
+        // --------------------------------------------------------------------
+        // Output-column counter
+        // --------------------------------------------------------------------
+
+        when(colTileCounter === (colSafe - 1.U)) {
+          
           colTileCounter := 0.U
+
         }.otherwise {
+
           colTileCounter := colTileCounter + 1.U
+        
         }
 
+
         // --------------------------------------------------------------------
-        // Fusion counter
+        // Fusion timer
         // --------------------------------------------------------------------
-        when( fusionCounter === 0.U ) {
-          fusionCounter := 31.U
+
+        when(fusionCounter === 0.U) {
+
+          fusionCounter :=31.U
+
         }.otherwise {
+
           fusionCounter := fusionCounter - 1.U
+        
         }
 
 
         // --------------------------------------------------------------------
-        // Normalizer phase counter
+        // Normalizer phase timer
         // --------------------------------------------------------------------
 
-        when( normCounter === 0.U ) {
+        when(normCounter === 0.U) {
+
           normCounter := io.norm_phase_load
+
         }.otherwise {
+
           normCounter := normCounter - 1.U
+        
         }
+
 
       }.otherwise {
+
+        // Next K tile of the same output tile.
         kTileCounter := kTileCounter + 1.U
+      
       }
 
+
     }.otherwise {
+
       rowCounter := rowCounter + 1.U
+    
     }
   }
 }
