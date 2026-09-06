@@ -195,8 +195,6 @@ class ComputeTimer(
 
   io.fusion_req := outputTileDone && (fusionCounter === 0.U)
 
-  io.norm_phase_change := outputTileDone && (normCounter === 0.U)
-
   // ==========================================================================
   // Counter update
   // ==========================================================================
@@ -253,21 +251,6 @@ class ComputeTimer(
         }.otherwise {
 
           fusionCounter := fusionCounter - 1.U
-        
-        }
-
-
-        // --------------------------------------------------------------------
-        // Normalizer phase timer
-        // --------------------------------------------------------------------
-
-        when(normCounter === 0.U) {
-
-          normCounter := io.norm_phase_load
-
-        }.otherwise {
-
-          normCounter := normCounter - 1.U
         
         }
 
