@@ -3,57 +3,29 @@ package npu.core
 import chisel3._
 import chisel3.util._
 
-
 // ============================================================================
-// Dynamic metadata travelling with TPU output.
+// Metadata aligned with the final flat TPU output stream.
 //
-// Static VPU controls such as
+// quant_param_update:
+//   Quant parameter context change.
+//   Policy is independently configurable.
 //
-//   alu_mode
-//   act_en
-//   norm_mode
-//   rope_en
-//
-// are NOT carried here.
-//
-// They remain constant for one macro-operation and should be held in
-// configuration registers.
-//
-// Only events whose meaning changes with the data stream are carried.
+// rope_param_update:
+//   RoPE logical-position parameter change.
+//   One pulse per completed output row.
 // ============================================================================
 class TPUStreamMeta extends Bundle {
-  val param_update = Bool()
-  val fusion_req = Bool()
+  val quant_param_update = Bool()
+  val rope_param_update  = Bool()
 }
 
-// ============================================================================
-// Compute Timer
-//
-// Logical datapath sequencer for TPU.
-//
-// Timing reference:
-//
-//   MXU output column 0 valid
-//
-// The timer counts only actually accepted MXU output rows.
-//
-//                  row0_valid
-//                      │
-//                      ▼
-//               Row Counter (16)
-//                      │
-//                      ▼
-//               K Tile Counter
-//                      │
-//                      ▼
-//              Output Tile Event
-//                │      │      │
-//                ▼      ▼      ▼
-//            param   fusion   norm
-//
-// Accumulator physical column skew is NOT handled here.
-// That belongs to TileAccumulator.
-// ============================================================================
+// Per-output-tile control which must survive until the accumulator
+// physically begins streaming that tile.
+class TPUTileCtrl extends Bundle {
+  val quant_param_update = Bool()
+  val fusion_req         = Bool()
+}
+
 class ComputeTimer(
   val tileSize: Int = 16
 ) extends Module {
@@ -61,212 +33,171 @@ class ComputeTimer(
   require(tileSize > 0)
 
   val io = IO(new Bundle {
-
-    // ------------------------------------------------------------------------
-    // Datapath progress
-    // ------------------------------------------------------------------------
+    // MXU column-0 output progress
     val row0_valid = Input(Bool())
-    val stall = Input(Bool())
+    val stall      = Input(Bool())
 
-    // ------------------------------------------------------------------------
-    // Operation dimensions
-    //
-    // intermNum:
-    //   number of K tiles accumulated into one output tile
-    //
-    // colNum:
-    //   number of output-column tiles in one logical output row
-    // ------------------------------------------------------------------------
+    // Number of K tiles accumulated into one output tile
     val intermNum = Input(UInt(32.W))
-    val colNum = Input(UInt(32.W))
 
     // ------------------------------------------------------------------------
-    // Accumulator logical control
+    // Quant parameter update policy
+    //
+    // Unit: completed output tiles
+    //
+    // 0 -> automatic update disabled
+    // 1 -> every output tile
+    // 2 -> every 2 output tiles
+    // ...
+    //
+    // Completely independent from RoPE.
     // ------------------------------------------------------------------------
+    val quantParamTilePeriod = Input(UInt(32.W))
 
-    // Level signal.
-    //
-    // High while the current K tile is the first K tile.
-    val accum_first = Output(Bool())
-
-    // One-cycle event referenced to MXU column 0.
-    //
-    // High when:
-    //
-    //   final K tile
-    //   +
-    //   final row
-    //
-    // reaches MXU output column 0.
+    // Accumulator control
+    val accum_first      = Output(Bool())
     val output_tile_done = Output(Bool())
 
-
-    // ------------------------------------------------------------------------
     // Dynamic metadata
-    //
-    // Valid only together with output_tile_done.
-    // ------------------------------------------------------------------------
-    val param_update = Output(Bool())
+    val quant_param_update = Output(Bool())
+    val rope_param_update  = Output(Bool())
+
+    // Lookahead control
     val fusion_req = Output(Bool())
   })
 
-
-  val run = !io.stall
-
+  val run  = !io.stall
   val fire = io.row0_valid && run
 
-
-  // ==========================================================================
-  // Safe configuration values
-  // ==========================================================================
-
   val intermSafe =
-    Mux( io.intermNum === 0.U, 1.U, io.intermNum )
+    Mux(io.intermNum === 0.U, 1.U, io.intermNum)
 
-  val colSafe = Mux( io.colNum === 0.U, 1.U, io.colNum )
-
+  val rowBits =
+    math.max(1, log2Ceil(tileSize))
 
   // ==========================================================================
-  // Row counter
+  // Output row progress inside one K tile
+  // ==========================================================================
+  val outputRowCounter =
+    RegInit(0.U(rowBits.W))
+
+  // ==========================================================================
+  // K-tile accumulation progress
+  // ==========================================================================
+  val kTileCounter =
+    RegInit(0.U(32.W))
+
+  // ==========================================================================
+  // Quant parameter schedule
   //
-  // Counts flat output rows from MXU column 0:
+  // Explicitly independent from row / RoPE scheduling.
+  // ==========================================================================
+  val quantParamTileCountdown =
+    RegInit(0.U(32.W))
+
+  // ==========================================================================
+  // Fusion schedule
   //
-  //   0 ... 15
+  // First event: output tile 15
+  // Repeat     : every 32 output tiles
   // ==========================================================================
+  val fusionTileCountdown =
+    RegInit(15.U(32.W))
 
-  val rowBits = math.max( 1, log2Ceil(tileSize) )
+  val lastRow =
+    outputRowCounter === (tileSize - 1).U
 
-  val rowCounter = RegInit(0.U(rowBits.W))
+  val lastKTile =
+    kTileCounter === (intermSafe - 1.U)
 
+  io.accum_first :=
+    kTileCounter === 0.U
 
-  // ==========================================================================
-  // K tile counter
+  // --------------------------------------------------------------------------
+  // A logical output row is complete only when it belongs to the final K tile.
   //
-  // 0 = first K tile
-  // ==========================================================================
-
-  val kTileCounter = RegInit(0.U(32.W))
-
-
-  // ==========================================================================
-  // Output-column tile counter
+  // This is the RoPE parameter boundary.
   //
-  // Used for parameter context change.
+  // Every final output row receives a new logical-position parameter.
+  // --------------------------------------------------------------------------
+  val outputRowDone =
+    fire &&
+    lastKTile
+
+  io.rope_param_update :=
+    outputRowDone
+
+  // --------------------------------------------------------------------------
+  // Output tile completion
+  // --------------------------------------------------------------------------
+  val outputTileDone =
+    outputRowDone &&
+    lastRow
+
+  io.output_tile_done :=
+    outputTileDone
+
+  // --------------------------------------------------------------------------
+  // Quant update
   //
-  // 0 means:
-  //
-  //   first output-column tile of a logical output row
-  // ==========================================================================
-  val colTileCounter = RegInit(0.U(32.W))
+  // Completely independent from RoPE and from old colTileCounter.
+  // --------------------------------------------------------------------------
+  val quantAutoUpdateEnabled =
+    io.quantParamTilePeriod =/= 0.U
+
+  io.quant_param_update :=
+    outputTileDone &&
+    quantAutoUpdateEnabled &&
+    (quantParamTileCountdown === 0.U)
+
+  // --------------------------------------------------------------------------
+  // Fusion event
+  // --------------------------------------------------------------------------
+  io.fusion_req :=
+    outputTileDone &&
+    (fusionTileCountdown === 0.U)
 
   // ==========================================================================
-  // Fusion counter
-  //
-  // Notion Compute Timer spec:
-  //
-  //   initial = 15
-  //   reload  = 31
+  // Logical progress
   // ==========================================================================
-  val fusionCounter = RegInit(15.U(32.W))
-
-  // ==========================================================================
-  // Current logical state
-  // ==========================================================================
-  val lastRow = rowCounter === (tileSize - 1).U
-
-  val lastKTile = kTileCounter === (intermSafe - 1.U)
-
-  io.accum_first := kTileCounter === 0.U
-
-  val outputTileDone = fire && lastRow && lastKTile
-
-  io.output_tile_done := outputTileDone
-
-
-  // ==========================================================================
-  // Metadata
-  //
-  // Generate EVENT bits only when the corresponding output tile completes.
-  //
-  // These bits will later be queued until the accumulator starts streaming
-  // the de-skewed output tile.
-  // ==========================================================================
-  io.param_update := outputTileDone && (colTileCounter === 0.U)
-
-  io.fusion_req := outputTileDone && (fusionCounter === 0.U)
-
-  // ==========================================================================
-  // Counter update
-  // ==========================================================================
-
   when(fire) {
-
-    // ------------------------------------------------------------------------
-    // One complete MXU output row accepted
-    // ------------------------------------------------------------------------
-
     when(lastRow) {
-
-      rowCounter := 0.U
-
-
-      // ----------------------------------------------------------------------
-      // One complete K tile accepted
-      // ----------------------------------------------------------------------
+      outputRowCounter := 0.U
 
       when(lastKTile) {
-
-        // Next output tile begins from its first K tile.
         kTileCounter := 0.U
-
-
-        // ====================================================================
-        // Completed one output tile.
-        // ====================================================================
-
-
-        // --------------------------------------------------------------------
-        // Output-column counter
-        // --------------------------------------------------------------------
-
-        when(colTileCounter === (colSafe - 1.U)) {
-          
-          colTileCounter := 0.U
-
-        }.otherwise {
-
-          colTileCounter := colTileCounter + 1.U
-        
-        }
-
-
-        // --------------------------------------------------------------------
-        // Fusion timer
-        // --------------------------------------------------------------------
-
-        when(fusionCounter === 0.U) {
-
-          fusionCounter :=31.U
-
-        }.otherwise {
-
-          fusionCounter := fusionCounter - 1.U
-        
-        }
-
-
       }.otherwise {
-
-        // Next K tile of the same output tile.
         kTileCounter := kTileCounter + 1.U
-      
       }
-
-
     }.otherwise {
+      outputRowCounter := outputRowCounter + 1.U
+    }
+  }
 
-      rowCounter := rowCounter + 1.U
-    
+  // ==========================================================================
+  // Per-output-tile control progress
+  // ==========================================================================
+  when(outputTileDone) {
+
+    // Quant schedule
+    when(quantAutoUpdateEnabled) {
+      when(quantParamTileCountdown === 0.U) {
+        quantParamTileCountdown :=
+          io.quantParamTilePeriod - 1.U
+      }.otherwise {
+        quantParamTileCountdown :=
+          quantParamTileCountdown - 1.U
+      }
+    }.otherwise {
+      quantParamTileCountdown := 0.U
+    }
+
+    // Fusion schedule
+    when(fusionTileCountdown === 0.U) {
+      fusionTileCountdown := 31.U
+    }.otherwise {
+      fusionTileCountdown :=
+        fusionTileCountdown - 1.U
     }
   }
 }

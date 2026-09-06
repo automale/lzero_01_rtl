@@ -5,257 +5,598 @@ import chiseltest._
 import org.scalatest.flatspec.AnyFlatSpec
 import scala.util.Random
 
-class TPUTopTest extends AnyFlatSpec with ChiselScalatestTester {
-  behavior of "Autonomous TPU_top"
+class TPUTopTest
+  extends AnyFlatSpec
+  with ChiselScalatestTester {
+
+  behavior of "TPU_top"
 
   private def runScenario(
     dut: TPU_top,
     dim: Int,
     numOutputs: Int,
     numKTiles: Int,
-    colNum: Int,
+    quantParamTilePeriod: Int,
     seed: Long,
     stallFn: Int => Boolean,
     requireNoBubble: Boolean
   ): Unit = {
-    val totalTiles = numOutputs * numKTiles
-    val rng = new Random(seed)
 
-    // A[y][q][m][k], W[y][q][n][k]
-    val aTiles = Array.tabulate(numOutputs, numKTiles, dim, dim) {
-      (_, _, _, _) => rng.nextInt(31) - 15
-    }
-    val wTiles = Array.tabulate(numOutputs, numKTiles, dim, dim) {
-      (_, _, _, _) => rng.nextInt(31) - 15
-    }
+    val totalTiles =
+      numOutputs * numKTiles
 
-    // Golden Y[y][m][n]
-    val golden = Array.ofDim[Int](numOutputs, dim, dim)
+    val rng =
+      new Random(seed)
+
+    // A[outputTile][kTile][m][k]
+    val aTiles =
+      Array.tabulate(
+        numOutputs,
+        numKTiles,
+        dim,
+        dim
+      ) {
+        (_, _, _, _) =>
+          rng.nextInt(31) - 15
+      }
+
+    // W[outputTile][kTile][n][k]
+    val wTiles =
+      Array.tabulate(
+        numOutputs,
+        numKTiles,
+        dim,
+        dim
+      ) {
+        (_, _, _, _) =>
+          rng.nextInt(31) - 15
+      }
+
+    // Golden Y[outputTile][m][n]
+    val golden =
+      Array.ofDim[Int](
+        numOutputs,
+        dim,
+        dim
+      )
+
     for {
       y <- 0 until numOutputs
       m <- 0 until dim
       n <- 0 until dim
     } {
       var sum = 0
+
       for {
         q <- 0 until numKTiles
         k <- 0 until dim
       } {
-        sum += aTiles(y)(q)(m)(k) * wTiles(y)(q)(n)(k)
+        sum +=
+          aTiles(y)(q)(m)(k) *
+          wTiles(y)(q)(n)(k)
       }
-      golden(y)(m)(n) = sum
+
+      golden(y)(m)(n) =
+        sum
     }
 
-    def tileToYQ(globalTile: Int): (Int, Int) =
-      (globalTile / numKTiles, globalTile % numKTiles)
+    def tileToYQ(
+      globalTile: Int
+    ): (Int, Int) =
+      (
+        globalTile / numKTiles,
+        globalTile % numKTiles
+      )
 
-    def driveInputZero(): Unit =
-      for (k <- 0 until dim) dut.io.in_input(k).poke(0.S(8.W))
-
-    def driveWeightZero(): Unit =
-      for (k <- 0 until dim) dut.io.in_weight(k).poke(0.S(8.W))
-
-    def driveInputRow(globalTile: Int, m: Int): Unit = {
-      val (y, q) = tileToYQ(globalTile)
-      for (k <- 0 until dim)
-        dut.io.in_input(k).poke(aTiles(y)(q)(m)(k).S(8.W))
+    def driveInputZero(): Unit = {
+      for(k <- 0 until dim) {
+        dut.io.in_input(k)
+          .poke(0.S(8.W))
+      }
     }
 
-    def driveWeightRow(globalTile: Int, n: Int): Unit = {
-      val (y, q) = tileToYQ(globalTile)
-      for (k <- 0 until dim)
-        dut.io.in_weight(k).poke(wTiles(y)(q)(n)(k).S(8.W))
+    def driveWeightZero(): Unit = {
+      for(k <- 0 until dim) {
+        dut.io.in_weight(k)
+          .poke(0.S(8.W))
+      }
     }
 
-    def expectedParamUpdate(y: Int): Boolean =
-      (y % colNum) == 0
+    def driveInputRow(
+      globalTile: Int,
+      m: Int
+    ): Unit = {
 
-    // fusionCounter initial=15, reload=31
-    // => Y15, Y47, Y79, ...
-    def expectedFusion(y: Int): Boolean =
-      y >= 15 && ((y - 15) % 32 == 0)
+      val (y, q) =
+        tileToYQ(globalTile)
 
-    // Initial state
+      for(k <- 0 until dim) {
+        dut.io.in_input(k)
+          .poke(
+            aTiles(y)(q)(m)(k)
+              .S(8.W)
+          )
+      }
+    }
+
+    def driveWeightRow(
+      globalTile: Int,
+      n: Int
+    ): Unit = {
+
+      val (y, q) =
+        tileToYQ(globalTile)
+
+      for(k <- 0 until dim) {
+        dut.io.in_weight(k)
+          .poke(
+            wTiles(y)(q)(n)(k)
+              .S(8.W)
+          )
+      }
+    }
+
+    def expectedQuant(
+      outputTile: Int
+    ): Boolean = {
+
+      quantParamTilePeriod > 0 &&
+      (
+        outputTile %
+        quantParamTilePeriod
+      ) == 0
+    }
+
+    def expectedFusion(
+      outputTile: Int
+    ): Boolean = {
+
+      outputTile >= 15 &&
+      (
+        (outputTile - 15) %
+        32
+      ) == 0
+    }
+
+    // ========================================================================
+    // Reset / initial configuration
+    // ========================================================================
     driveInputZero()
     driveWeightZero()
-    dut.io.input_valid.poke(false.B)
-    dut.io.input_tile_start.poke(false.B)
-    dut.io.weight_valid.poke(false.B)
-    dut.io.intermNum.poke(numKTiles.U(32.W))
-    dut.io.colNum.poke(colNum.U(32.W))
-    dut.io.stall.poke(false.B)
-    dut.io.clear_W.poke(true.B)
+
+    dut.io.input_valid
+      .poke(false.B)
+
+    dut.io.input_tile_start
+      .poke(false.B)
+
+    dut.io.weight_valid
+      .poke(false.B)
+
+    dut.io.intermNum
+      .poke(numKTiles.U)
+
+    dut.io.quantParamTilePeriod
+      .poke(quantParamTilePeriod.U)
+
+    dut.io.stall
+      .poke(false.B)
+
+    dut.io.clear_W
+      .poke(true.B)
 
     dut.clock.step()
-    dut.io.clear_W.poke(false.B)
 
+    dut.io.clear_W
+      .poke(false.B)
+
+    // ========================================================================
     // Initial W0 preload
-    for (n <- 0 until dim) {
+    // ========================================================================
+    for(n <- 0 until dim) {
+
       driveInputZero()
       driveWeightRow(0, n)
-      dut.io.input_valid.poke(false.B)
-      dut.io.input_tile_start.poke(false.B)
-      dut.io.weight_valid.poke(true.B)
-      dut.io.stall.poke(false.B)
-      dut.io.fatal_alert.expect(false.B)
+
+      dut.io.input_valid
+        .poke(false.B)
+
+      dut.io.input_tile_start
+        .poke(false.B)
+
+      dut.io.weight_valid
+        .poke(true.B)
+
+      dut.io.stall
+        .poke(false.B)
+
+      dut.io.fatal_alert
+        .expect(false.B)
+
       dut.clock.step()
     }
-    dut.io.weight_valid.poke(false.B)
 
-    val totalComputeCycles = totalTiles * dim
-    val expectedOutputRows = numOutputs * dim
+    dut.io.weight_valid
+      .poke(false.B)
 
-    var logicalCycle = 0
-    var physicalCycle = 0
-    var outputRowsSeen = 0
-    var streamStarted = false
+    val totalComputeCycles =
+      totalTiles * dim
 
-    // fusion_req seen on previous accepted cycle.
-    var fusionDueForRow0 = false
-    var fusionPulseCount = 0
+    val expectedOutputRows =
+      numOutputs * dim
 
-    while (outputRowsSeen < expectedOutputRows && physicalCycle < 100000) {
-      val stallNow = stallFn(physicalCycle)
+    var logicalCycle =
+      0
 
-      // A stream: logical schedule does not advance during stall.
-      if (logicalCycle < totalComputeCycles) {
-        val globalTile = logicalCycle / dim
-        val m = logicalCycle % dim
-        driveInputRow(globalTile, m)
-        dut.io.input_valid.poke(true.B)
-        dut.io.input_tile_start.poke((m == 0).B)
+    var physicalCycle =
+      0
+
+    var outputRowsSeen =
+      0
+
+    var streamStarted =
+      false
+
+    var fusionFromPreviousAcceptedCycle =
+      false
+
+    var quantPulseCount =
+      0
+
+    var ropePulseCount =
+      0
+
+    var fusionPulseCount =
+      0
+
+    // ========================================================================
+    // Main simulation
+    // ========================================================================
+    while(
+      outputRowsSeen <
+      expectedOutputRows &&
+      physicalCycle <
+      100000
+    ) {
+
+      val stallNow =
+        stallFn(physicalCycle)
+
+      // ----------------------------------------------------------------------
+      // Input scheduling
+      // ----------------------------------------------------------------------
+      if(
+        logicalCycle <
+        totalComputeCycles
+      ) {
+
+        val globalTile =
+          logicalCycle / dim
+
+        val m =
+          logicalCycle % dim
+
+        driveInputRow(
+          globalTile,
+          m
+        )
+
+        dut.io.input_valid
+          .poke(true.B)
+
+        dut.io.input_tile_start
+          .poke((m == 0).B)
+
       } else {
+
         driveInputZero()
-        dut.io.input_valid.poke(false.B)
-        dut.io.input_tile_start.poke(false.B)
+
+        dut.io.input_valid
+          .poke(false.B)
+
+        dut.io.input_tile_start
+          .poke(false.B)
       }
 
-      // Rolling weight load:
-      // W1 = logical 15..30
-      // W2 = logical 31..46
+      // ----------------------------------------------------------------------
+      // Rolling weight schedule
+      //
+      // W1: logical cycle 15..30
+      // W2: logical cycle 31..46
       // ...
-      val relativeWeightCycle = logicalCycle - (dim - 1)
+      // ----------------------------------------------------------------------
+      val relativeWeightCycle =
+        logicalCycle -
+        (dim - 1)
 
-      if (relativeWeightCycle >= 0) {
-        val nextGlobalTile = 1 + relativeWeightCycle / dim
-        val n = relativeWeightCycle % dim
+      if(
+        relativeWeightCycle >= 0
+      ) {
 
-        if (nextGlobalTile < totalTiles) {
-          driveWeightRow(nextGlobalTile, n)
-          dut.io.weight_valid.poke(true.B)
-        } else {
-          driveWeightZero()
-          dut.io.weight_valid.poke(false.B)
-        }
-      } else {
-        driveWeightZero()
-        dut.io.weight_valid.poke(false.B)
-      }
+        val nextGlobalTile =
+          1 +
+          relativeWeightCycle / dim
 
-      dut.io.stall.poke(stallNow.B)
+        val n =
+          relativeWeightCycle % dim
 
-      val valid0 = dut.io.out_valid(0).peek().litToBoolean
-      val paramNow = dut.io.out_meta.param_update.peek().litToBoolean
-      val fusionNow = dut.io.out_meta.fusion_req.peek().litToBoolean
+        if(
+          nextGlobalTile <
+          totalTiles
+        ) {
 
-      if (stallNow) {
-        // Visible output is invalid during stall.
-        for (n <- 0 until dim) dut.io.out_valid(n).expect(false.B)
-        dut.io.out_meta.param_update.expect(false.B)
-        dut.io.out_meta.fusion_req.expect(false.B)
-      } else {
-        if (valid0) {
-          val y = outputRowsSeen / dim
-          val m = outputRowsSeen % dim
-
-          for (n <- 0 until dim) {
-            dut.io.out_valid(n).expect(true.B)
-            dut.io.out_accum(n).expect(golden(y)(m)(n).S(32.W))
-          }
-
-          // param_update must travel WITH row0.
-          val expectedParam =
-            (m == 0) && expectedParamUpdate(y)
-
-          assert(
-            paramNow == expectedParam,
-            s"param_update mismatch: physical=$physicalCycle y=$y m=$m " +
-            s"expected=$expectedParam actual=$paramNow"
+          driveWeightRow(
+            nextGlobalTile,
+            n
           )
 
-          // fusion_req must have appeared exactly one accepted cycle BEFORE row0.
-          if (m == 0) {
-            val expectedFusionForTile = expectedFusion(y)
+          dut.io.weight_valid
+            .poke(true.B)
+
+        } else {
+
+          driveWeightZero()
+
+          dut.io.weight_valid
+            .poke(false.B)
+        }
+
+      } else {
+
+        driveWeightZero()
+
+        dut.io.weight_valid
+          .poke(false.B)
+      }
+
+      dut.io.stall
+        .poke(stallNow.B)
+
+      // ----------------------------------------------------------------------
+      // Observe only TPU_top public outputs
+      // ----------------------------------------------------------------------
+      val valid =
+        dut.io.out_valid(0)
+          .peek()
+          .litToBoolean
+
+      val quantNow =
+        dut.io.out_meta
+          .quant_param_update
+          .peek()
+          .litToBoolean
+
+      val ropeNow =
+        dut.io.out_meta
+          .rope_param_update
+          .peek()
+          .litToBoolean
+
+      val fusionNow =
+        dut.io.fusion_req
+          .peek()
+          .litToBoolean
+
+      // ======================================================================
+      // Stall contract
+      // ======================================================================
+      if(stallNow) {
+
+        for(n <- 0 until dim) {
+          dut.io.out_valid(n)
+            .expect(false.B)
+        }
+
+        dut.io.out_meta
+          .quant_param_update
+          .expect(false.B)
+
+        dut.io.out_meta
+          .rope_param_update
+          .expect(false.B)
+
+        dut.io.fusion_req
+          .expect(false.B)
+
+      } else {
+
+        // ====================================================================
+        // Valid output row
+        // ====================================================================
+        if(valid) {
+
+          val outputTile =
+            outputRowsSeen / dim
+
+          val row =
+            outputRowsSeen % dim
+
+          // --------------------------------------------------------------
+          // All lanes must be valid and data-correct.
+          // --------------------------------------------------------------
+          for(n <- 0 until dim) {
+
+            dut.io.out_valid(n)
+              .expect(true.B)
+
+            dut.io.out_accum(n)
+              .expect(
+                golden(
+                  outputTile
+                )(row)(n).S(32.W)
+              )
+          }
+
+          // --------------------------------------------------------------
+          // RoPE
+          //
+          // EVERY completed flat output row changes logical position
+          // context, therefore update must be asserted on every valid row.
+          // --------------------------------------------------------------
+          assert(
+            ropeNow,
+            s"rope_param_update missing: physical=$physicalCycle tile=$outputTile row=$row"
+          )
+
+          ropePulseCount += 1
+
+          // --------------------------------------------------------------
+          // Quant
+          //
+          // Independent policy.
+          // Only row0 of the selected output tile carries the update pulse.
+          // --------------------------------------------------------------
+          val expectedQuantNow =
+            row == 0 &&
+            expectedQuant(outputTile)
+
+          assert(
+            quantNow ==
+            expectedQuantNow,
+            s"quant_param_update mismatch: physical=$physicalCycle tile=$outputTile row=$row expected=$expectedQuantNow actual=$quantNow"
+          )
+
+          if(quantNow) {
+            quantPulseCount += 1
+          }
+
+          // --------------------------------------------------------------
+          // Fusion
+          //
+          // fusion_req must have appeared exactly one ACCEPTED cycle before
+          // the corresponding tile row0.
+          // --------------------------------------------------------------
+          if(row == 0) {
+
+            val expectedFusionNow =
+              expectedFusion(outputTile)
 
             assert(
-              fusionDueForRow0 == expectedFusionForTile,
-              s"fusion_req timing mismatch at Y$y row0: " +
-              s"expectedPreviousCycle=$expectedFusionForTile " +
-              s"actualPreviousCycle=$fusionDueForRow0"
+              fusionFromPreviousAcceptedCycle ==
+              expectedFusionNow,
+              s"fusion_req timing mismatch: tile=$outputTile expectedPrevious=$expectedFusionNow actualPrevious=$fusionFromPreviousAcceptedCycle"
             )
           }
 
           outputRowsSeen += 1
           streamStarted = true
+
         } else {
-          // param_update may never exist without a row0.
+
+          // No row => no data-aligned metadata.
           assert(
-            !paramNow,
-            s"param_update asserted without valid output at physical=$physicalCycle"
+            !quantNow,
+            s"quant_param_update asserted without output valid at physical=$physicalCycle"
           )
 
-          if (requireNoBubble && streamStarted && outputRowsSeen < expectedOutputRows) {
+          assert(
+            !ropeNow,
+            s"rope_param_update asserted without output valid at physical=$physicalCycle"
+          )
+
+          if(
+            requireNoBubble &&
+            streamStarted &&
+            outputRowsSeen <
+            expectedOutputRows
+          ) {
+
             fail(
-              s"Unexpected logical output bubble: physical=$physicalCycle " +
-              s"logical=$logicalCycle rowsSeen=$outputRowsSeen"
+              s"Unexpected output bubble: physical=$physicalCycle logical=$logicalCycle rowsSeen=$outputRowsSeen"
             )
           }
         }
 
-        if (fusionNow) {
+        if(fusionNow) {
           fusionPulseCount += 1
         }
 
-        // For the next accepted cycle.
-        fusionDueForRow0 = fusionNow
+        fusionFromPreviousAcceptedCycle =
+          fusionNow
       }
 
-      dut.io.fatal_alert.expect(false.B)
+      dut.io.fatal_alert
+        .expect(false.B)
+
       dut.clock.step()
 
-      if (!stallNow) logicalCycle += 1
+      if(!stallNow) {
+        logicalCycle += 1
+      }
+
       physicalCycle += 1
     }
 
+    // ========================================================================
+    // Final checks
+    // ========================================================================
     assert(
-      outputRowsSeen == expectedOutputRows,
+      outputRowsSeen ==
+      expectedOutputRows,
       s"Expected $expectedOutputRows output rows, got $outputRowsSeen"
     )
 
-    val expectedFusionCount =
-      (0 until numOutputs).count(expectedFusion)
+    // RoPE = every output row
+    assert(
+      ropePulseCount ==
+      expectedOutputRows,
+      s"Expected $expectedOutputRows rope_param_update pulses, got $ropePulseCount"
+    )
+
+    val expectedQuantCount =
+      if(quantParamTilePeriod == 0) {
+        0
+      } else {
+        (0 until numOutputs)
+          .count(
+            _ % quantParamTilePeriod == 0
+          )
+      }
 
     assert(
-      fusionPulseCount == expectedFusionCount,
+      quantPulseCount ==
+      expectedQuantCount,
+      s"Expected $expectedQuantCount quant_param_update pulses, got $quantPulseCount"
+    )
+
+    val expectedFusionCount =
+      (0 until numOutputs)
+        .count(expectedFusion)
+
+    assert(
+      fusionPulseCount ==
+      expectedFusionCount,
       s"Expected $expectedFusionCount fusion_req pulses, got $fusionPulseCount"
     )
   }
 
-  it should "stream intermNum=1 tiles with zero-bubble ping-pong and exact metadata timing" in {
+  // ==========================================================================
+  // 1. K=1 zero-bubble + Quant/RoPE complete separation
+  // ==========================================================================
+  it should
+    "stream continuously while keeping Quant and RoPE metadata fully independent" in {
+
     val dim = 16
 
-    test(new TPU_top(
-      numRows = dim,
-      numCols = dim,
-      inBits = 8,
-      accBits = 32
-    )) { dut =>
+    test(
+      new TPU_top(
+        numRows = dim,
+        numCols = dim,
+        inBits = 8,
+        accBits = 32
+      )
+    ) { dut =>
+
       runScenario(
         dut = dut,
         dim = dim,
-        numOutputs = 20,   // includes Y15 fusion event
+        numOutputs = 20,
         numKTiles = 1,
-        colNum = 4,
+
+        // Quant only once per 4 output tiles.
+        // RoPE still updates on EVERY output row.
+        quantParamTilePeriod = 4,
+
         seed = 0x10012002L,
         stallFn = _ => false,
         requireNoBubble = true
@@ -263,21 +604,29 @@ class TPUTopTest extends AnyFlatSpec with ChiselScalatestTester {
     }
   }
 
-  it should "accumulate multiple K tiles under autonomous ComputeTimer control" in {
+  // ==========================================================================
+  // 2. Multi-K accumulation
+  // ==========================================================================
+  it should
+    "preserve independent metadata under multi-K accumulation" in {
+
     val dim = 16
 
-    test(new TPU_top(
-      numRows = dim,
-      numCols = dim,
-      inBits = 8,
-      accBits = 32
-    )) { dut =>
+    test(
+      new TPU_top(
+        numRows = dim,
+        numCols = dim,
+        inBits = 8,
+        accBits = 32
+      )
+    ) { dut =>
+
       runScenario(
         dut = dut,
         dim = dim,
-        numOutputs = 6,
+        numOutputs = 8,
         numKTiles = 3,
-        colNum = 3,
+        quantParamTilePeriod = 2,
         seed = 0x30042006L,
         stallFn = _ => false,
         requireNoBubble = false
@@ -285,26 +634,41 @@ class TPUTopTest extends AnyFlatSpec with ChiselScalatestTester {
     }
   }
 
-  it should "preserve data and metadata timing across global stalls" in {
+  // ==========================================================================
+  // 3. Quant automatic update disabled + stalls
+  //
+  // This is a useful proof that RoPE has no dependency on Quant scheduling.
+  // ==========================================================================
+  it should
+    "keep RoPE row updates alive when Quant auto-update is disabled and stalls occur" in {
+
     val dim = 16
 
-    test(new TPU_top(
-      numRows = dim,
-      numCols = dim,
-      inBits = 8,
-      accBits = 32
-    )) { dut =>
+    test(
+      new TPU_top(
+        numRows = dim,
+        numCols = dim,
+        inBits = 8,
+        accBits = 32
+      )
+    ) { dut =>
+
       runScenario(
         dut = dut,
         dim = dim,
         numOutputs = 20,
         numKTiles = 1,
-        colNum = 4,
+
+        // Quant completely disabled.
+        quantParamTilePeriod = 0,
+
         seed = 0x55aa77ccL,
+
         stallFn = p =>
           (p % 19 == 5) ||
           (p % 19 == 6) ||
           (p % 37 == 11),
+
         requireNoBubble = true
       )
     }
