@@ -98,22 +98,16 @@ class InputSkewLane(
           0.S(dataBits.W)
         )
 
-      validPipe(0) :=
-        io.in_valid
+      validPipe(0) := io.in_valid
 
-      updatePipe(0) :=
-        io.in_valid &&
-        io.in_tile_start
+      updatePipe(0) := io.in_valid && io.in_tile_start
 
       for (i <- 1 until delayCycles) {
-        dataPipe(i) :=
-          dataPipe(i - 1)
+        dataPipe(i) := dataPipe(i - 1)
 
-        validPipe(i) :=
-          validPipe(i - 1)
+        validPipe(i) := validPipe(i - 1)
 
-        updatePipe(i) :=
-          updatePipe(i - 1)
+        updatePipe(i) := updatePipe(i - 1)
       }
     }
 
@@ -124,13 +118,9 @@ class InputSkewLane(
         0.S(dataBits.W)
       )
 
-    io.out_valid :=
-      run &&
-      validPipe(delayCycles - 1)
+    io.out_valid := run && validPipe(delayCycles - 1)
 
-    io.out_weight_update :=
-      run &&
-      updatePipe(delayCycles - 1)
+    io.out_weight_update := run && updatePipe(delayCycles - 1)
   }
 }
 
@@ -236,29 +226,21 @@ class DataOrchUnit(
 
   for (k <- 0 until numRows) {
 
-    val lane =
-      skewLanes(k)
+    val lane = skewLanes(k)
 
-    lane.io.in_data :=
-      io.in_input(k)
+    lane.io.in_data := io.in_input(k)
 
-    lane.io.in_valid :=
-      io.input_valid
+    lane.io.in_valid := io.input_valid
 
-    lane.io.in_tile_start :=
-      io.input_tile_start
+    lane.io.in_tile_start := io.input_tile_start
 
-    lane.io.stall :=
-      io.stall
+    lane.io.stall := io.stall
 
-    io.mxu_input(k) :=
-      lane.io.out_data
+    io.mxu_input(k) := lane.io.out_data
 
-    io.mxu_input_valid(k) :=
-      lane.io.out_valid
+    io.mxu_input_valid(k) := lane.io.out_valid
 
-    io.weight_update_row(k) :=
-      lane.io.out_weight_update
+    io.weight_update_row(k) := lane.io.out_weight_update
   }
 
   // ==========================================================================
@@ -283,11 +265,7 @@ class DataOrchUnit(
       )
     )
 
-  val weightIdxBits =
-    math.max(
-      1,
-      log2Ceil(numCols)
-    )
+  val weightIdxBits = math.max( 1, log2Ceil(numCols) )
 
   val weightLoadIdx =
     RegInit(
@@ -296,17 +274,12 @@ class DataOrchUnit(
 
   when(run && io.weight_valid) {
 
-    shadowWeight(weightLoadIdx) :=
-      io.in_weight
+    shadowWeight(weightLoadIdx) := io.in_weight
 
-    when(
-      weightLoadIdx ===
-      (numCols - 1).U
-    ) {
+    when( weightLoadIdx === (numCols - 1).U ) {
       weightLoadIdx := 0.U
     }.otherwise {
-      weightLoadIdx :=
-        weightLoadIdx + 1.U
+      weightLoadIdx := weightLoadIdx + 1.U
     }
   }
 
@@ -315,12 +288,9 @@ class DataOrchUnit(
   //
   // PE[k][n] requires W[n][k]
   // ==========================================================================
-
   for (k <- 0 until numRows) {
     for (n <- 0 until numCols) {
-
-      io.mxu_weight(k)(n) :=
-        shadowWeight(n)(k)
+      io.mxu_weight(k)(n) := shadowWeight(n)(k)
     }
   }
 

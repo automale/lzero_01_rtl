@@ -39,7 +39,7 @@ mxu-test:
 
 tpu-test:
 	docker exec -it lzero_rtl_env sbt \
-	  'set Compile / unmanagedSources ~= (_.filter(f => f.getName == "MXU.scala" || f.getName == "Orch.scala" || f.getName == "Accum.scala" || f.getName == "TPU.scala"))' \
+	  'set Compile / unmanagedSources ~= (_.filter(f => f.getName == "MXU.scala" || f.getName == "Orch.scala" || f.getName == "Accum.scala" || f.getName == "ComputeTimer.scala" || f.getName == "TPU.scala"))' \
 	  'set Test / unmanagedSources ~= (_.filter(_.getName == "TPU_Test.scala"))' \
 	  'testOnly npu.top.TPUTopTest'
 

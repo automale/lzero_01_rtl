@@ -3,885 +3,100 @@ package npu.top
 import chisel3._
 import chiseltest._
 import org.scalatest.flatspec.AnyFlatSpec
-
 import scala.util.Random
-
 
 class TPUTopTest
     extends AnyFlatSpec
     with ChiselScalatestTester {
-  
-  behavior of "TPU_top"
 
-    it should "produce Y0 Y1 Y2 consecutively while overlapping pong streaming with next ping accumulation" in {
+  behavior of "Autonomous TPU_top"
 
-    val dim =
-        16
+  private def runScenario(
+    dut: TPU_top,
+    dim: Int,
+    numOutputs: Int,
+    numKTiles: Int,
+    colNum: Int,
+    normPhaseLoad: Int,
+    seed: Long,
+    stallFn: Int => Boolean,
+    requireNoBubble: Boolean
+  ): Unit = {
 
-    val numOutputs =
-        3
-
-    val numKTiles =
-        2
-
-    val totalTiles =
-        numOutputs * numKTiles
-
-    val rng =
-        new Random(
-        0x55aa1234L
-        )
-
-
-    // ==========================================================================
-    // A[y][q][m][k]
-    //
-    // y : output tile
-    // q : K tile
-    // m : output row
-    // k : reduction dimension
-    // ==========================================================================
+    val totalTiles = numOutputs * numKTiles
+    val rng = new Random(seed)
 
     val aTiles =
-        Array.tabulate(
-        numOutputs,
-        numKTiles,
-        dim,
-        dim
-        ) { (_, _, _, _) =>
-
-        rng.nextInt(31) - 15
-        }
-
-
-    // ==========================================================================
-    // W[y][q][n][k]
-    // ==========================================================================
+      Array.tabulate(numOutputs, numKTiles, dim, dim) {
+        (_, _, _, _) => rng.nextInt(31) - 15
+      }
 
     val wTiles =
-        Array.tabulate(
-        numOutputs,
-        numKTiles,
-        dim,
-        dim
-        ) { (_, _, _, _) =>
-
-        rng.nextInt(31) - 15
-        }
-
-
-    // ==========================================================================
-    // Golden
-    //
-    // Y[y][m][n]
-    //
-    //   = sum_q sum_k
-    //
-    //       A[y][q][m][k]
-    //       *
-    //       W[y][q][n][k]
-    // ==========================================================================
+      Array.tabulate(numOutputs, numKTiles, dim, dim) {
+        (_, _, _, _) => rng.nextInt(31) - 15
+      }
 
     val golden =
-        Array.ofDim[Int](
-        numOutputs,
-        dim,
-        dim
-        )
-
+      Array.ofDim[Int](numOutputs, dim, dim)
 
     for {
-        y <- 0 until numOutputs
-        m <- 0 until dim
-        n <- 0 until dim
+      y <- 0 until numOutputs
+      m <- 0 until dim
+      n <- 0 until dim
     } {
-
-        var sum =
-        0
-
-        for {
+      var sum = 0
+      for {
         q <- 0 until numKTiles
         k <- 0 until dim
-        } {
-
+      } {
         sum +=
-            aTiles(y)(q)(m)(k) *
-            wTiles(y)(q)(n)(k)
-        }
-
-        golden(y)(m)(n) =
-        sum
+          aTiles(y)(q)(m)(k) *
+          wTiles(y)(q)(n)(k)
+      }
+      golden(y)(m)(n) = sum
     }
 
-
-    test(
-        new TPU_top(
-        numRows = dim,
-        numCols = dim,
-        inBits = 8,
-        accBits = 32
-        )
-    ) { dut =>
-
-
-        // ========================================================================
-        // Helpers
-        // ========================================================================
-
-        def driveInputZero(): Unit = {
-
-        for (
-            k <- 0 until dim
-        ) {
-
-            dut.io.in_input(k)
-            .poke(
-                0.S(8.W)
-            )
-        }
-        }
-
-
-        def driveWeightZero(): Unit = {
-
-        for (
-            k <- 0 until dim
-        ) {
-
-            dut.io.in_weight(k)
-            .poke(
-                0.S(8.W)
-            )
-        }
-        }
-
-
-        def tileToYQ(
-        globalTile: Int
-        ): (Int, Int) = {
-
-        val y =
-            globalTile / numKTiles
-
-        val q =
-            globalTile % numKTiles
-
-        (y, q)
-        }
-
-
-        def driveInputRow(
-        globalTile: Int,
-        m: Int
-        ): Unit = {
-
-        val (y, q) =
-            tileToYQ(globalTile)
-
-        for (
-            k <- 0 until dim
-        ) {
-
-            dut.io.in_input(k)
-            .poke(
-                aTiles(y)(q)(m)(k)
-                .S(8.W)
-            )
-        }
-        }
-
-
-        def driveWeightRow(
-        globalTile: Int,
-        n: Int
-        ): Unit = {
-
-        val (y, q) =
-            tileToYQ(globalTile)
-
-        for (
-            k <- 0 until dim
-        ) {
-
-            dut.io.in_weight(k)
-            .poke(
-                wTiles(y)(q)(n)(k)
-                .S(8.W)
-            )
-        }
-        }
-
-
-        // ========================================================================
-        // Initial state
-        // ========================================================================
-
-        driveInputZero()
-        driveWeightZero()
-
-
-        dut.io.input_valid
-        .poke(false.B)
-
-        dut.io.input_tile_start
-        .poke(false.B)
-
-        dut.io.weight_valid
-        .poke(false.B)
-
-
-        dut.io.accum_en
-        .poke(false.B)
-
-        dut.io.accum_first
-        .poke(false.B)
-
-        dut.io.accum_snapshot
-        .poke(false.B)
-
-        dut.io.accum_stream_en
-        .poke(false.B)
-
-
-        dut.io.stall
-        .poke(false.B)
-
-
-        dut.io.clear_W
-        .poke(true.B)
-
-
-        dut.clock.step(1)
-
-
-        dut.io.clear_W
-        .poke(false.B)
-
-
-        // ========================================================================
-        // Initial preload:
-        //
-        // global W tile 0
-        // ========================================================================
-
-        for (
-        n <- 0 until dim
-        ) {
-
-        driveWeightRow(
-            globalTile = 0,
-            n = n
-        )
-
-        dut.io.weight_valid
-            .poke(true.B)
-
-        dut.clock.step(1)
-        }
-
-
-        dut.io.weight_valid
-        .poke(false.B)
-
-
-        // ========================================================================
-        // Timing functions
-        // ========================================================================
-        //
-        // MXU column0 result is captured by accumulator:
-        //
-        //   captureCycle =
-        //
-        //       globalTile * dim
-        //       + dim
-        //       + m
-        //
-        //
-        // because MXU output is registered and accumulator captures it
-        // on the following edge.
-        // ========================================================================
-
-
-        def snapshotCol0Cycle(
-        outputTile: Int
-        ): Int = {
-
-        val lastGlobalTile =
-            (outputTile + 1) *
-            numKTiles -
-            1
-
-        // last row m = dim-1
-        lastGlobalTile * dim +
-        dim +
-        (dim - 1)
-        }
-
-
-        // Last column receives snapshot dim-1 cycles later.
-        def snapshotAllColumnsDone(
-        outputTile: Int
-        ): Int = {
-
-        snapshotCol0Cycle(
-            outputTile
-        ) +
-        (dim - 1)
-        }
-
-
-        // Start reading pong on the next cycle.
-        def streamStartCycle(
-        outputTile: Int
-        ): Int = {
-
-        snapshotAllColumnsDone(
-            outputTile
-        ) + 1
-        }
-
-
-        // ========================================================================
-        // Print expected scheduling for debug
-        // ========================================================================
-
-        for (
-        y <- 0 until numOutputs
-        ) {
-
-        println(
-            s"""
-            |Output Y$y:
-            |  snapshot col0 = ${snapshotCol0Cycle(y)}
-            |  snapshot done = ${snapshotAllColumnsDone(y)}
-            |  stream start  = ${streamStartCycle(y)}
-            |""".stripMargin
-        )
-        }
-
-
-        // Final cycle must include entire Y2 stream.
-        val finalCycle =
-        streamStartCycle(
-            numOutputs - 1
-        ) +
-        dim -
-        1
-
-
-        // ========================================================================
-        // Main pipeline
-        // ========================================================================
-
-        for (
-        cycle <- 0 to finalCycle
-        ) {
-
-
-        // ======================================================================
-        // [1] INPUT
-        //
-        // Six tiles are supplied continuously:
-        //
-        // tile0 :  0..15
-        // tile1 : 16..31
-        // ...
-        // tile5 : 80..95
-        // ======================================================================
-
-        if (
-            cycle <
-            totalTiles * dim
-        ) {
-
-            val globalTile =
-            cycle / dim
-
-            val m =
-            cycle % dim
-
-
-            driveInputRow(
-            globalTile = globalTile,
-            m = m
-            )
-
-
-            dut.io.input_valid
-            .poke(true.B)
-
-
-            dut.io.input_tile_start
-            .poke(
-                (m == 0).B
-            )
-
-        } else {
-
-            driveInputZero()
-
-
-            dut.io.input_valid
-            .poke(false.B)
-
-
-            dut.io.input_tile_start
-            .poke(false.B)
-        }
-
-
-        // ======================================================================
-        // [2] Rolling weight preload
-        //
-        // Same single-shadow schedule already validated:
-        //
-        // W1 starts cycle 15
-        // W2 starts cycle 31
-        // W3 starts cycle 47
-        // ...
-        // ======================================================================
-
-        val relativeWeightCycle =
-            cycle -
-            (dim - 1)
-
-
-        if (
-            relativeWeightCycle >= 0
-        ) {
-
-            val globalWeightTile =
-            1 +
-            relativeWeightCycle / dim
-
-            val n =
-            relativeWeightCycle % dim
-
-
-            if (
-            globalWeightTile <
-            totalTiles
-            ) {
-
-            driveWeightRow(
-                globalTile =
-                globalWeightTile,
-
-                n = n
-            )
-
-
-            dut.io.weight_valid
-                .poke(true.B)
-
-            } else {
-
-            driveWeightZero()
-
-
-            dut.io.weight_valid
-                .poke(false.B)
-            }
-
-        } else {
-
-            driveWeightZero()
-
-
-            dut.io.weight_valid
-            .poke(false.B)
-        }
-
-
-        // ======================================================================
-        // [3] Accumulator input validity
-        //
-        // Column0 produces a continuous stream from:
-        //
-        // cycle 16
-        //
-        // through:
-        //
-        // totalTiles*16 + 15
-        // ======================================================================
-
-        val firstCapture =
-            dim
-
-        val lastCapture =
-            totalTiles * dim +
-            dim -
-            1
-
-
-        val accumActive =
-            cycle >= firstCapture &&
-            cycle <= lastCapture
-
-
-        dut.io.accum_en
-            .poke(
-            accumActive.B
-            )
-
-
-        // ======================================================================
-        // [4] accum_first
-        //
-        // Determine which global K tile is currently being captured.
-        //
-        // captureStreamIndex:
-        //
-        //   0..15  -> global tile 0
-        //   16..31 -> global tile 1
-        //   ...
-        //
-        // First K tile of each output:
-        //
-        //   global tile 0
-        //   global tile 2
-        //   global tile 4
-        // ======================================================================
-
-        val captureStreamIndex =
-            cycle -
-            dim
-
-
-        val isFirstKTile = {
-
-            if (
-            captureStreamIndex >= 0 &&
-            captureStreamIndex <
-            totalTiles * dim
-            ) {
-
-            val globalTile =
-                captureStreamIndex /
-                dim
-
-            (
-                globalTile %
-                numKTiles
-            ) == 0
-
-            } else {
-
-            false
-            }
-        }
-
-
-        dut.io.accum_first
-            .poke(
-            isFirstKTile.B
-            )
-
-
-        // ======================================================================
-        // [5] snapshot
-        //
-        // Snapshot at:
-        //
-        // Y0 completion
-        // Y1 completion
-        // Y2 completion
-        // ======================================================================
-
-        val snapshotNow =
-            (0 until numOutputs)
-            .exists { y =>
-
-                cycle ==
-                snapshotCol0Cycle(y)
-            }
-
-
-        dut.io.accum_snapshot
-            .poke(
-            snapshotNow.B
-            )
-
-
-        // ======================================================================
-        // [6] Pong streaming
-        //
-        // Find whether current cycle belongs to one of:
-        //
-        // Y0 stream
-        // Y1 stream
-        // Y2 stream
-        // ======================================================================
-
-        var activeOutput =
-            -1
-
-        var activeRow =
-            -1
-
-
-        for (
-            y <- 0 until numOutputs
-        ) {
-
-            val start =
-            streamStartCycle(y)
-
-            val end =
-            start +
-            dim -
-            1
-
-
-            if (
-            cycle >= start &&
-            cycle <= end
-            ) {
-
-            activeOutput =
-                y
-
-            activeRow =
-                cycle - start
-            }
-        }
-
-
-        val streamActive =
-            activeOutput >= 0
-
-
-        dut.io.accum_stream_en
-            .poke(
-            streamActive.B
-            )
-
-
-        dut.io.stall
-            .poke(false.B)
-
-
-        // ======================================================================
-        // [7] CHECK PONG BEFORE CLOCK EDGE
-        //
-        // out_vec is combinationally read from pong using read_ptr.
-        // ======================================================================
-
-        if (
-            streamActive
-        ) {
-
-            for (
-            n <- 0 until dim
-            ) {
-
-            dut.io.out_valid(n)
-                .expect(
-                true.B
-                )
-
-
-            dut.io.out_accum(n)
-                .expect(
-                golden(
-                    activeOutput
-                )(
-                    activeRow
-                )(
-                    n
-                ).S(32.W),
-
-                s"""
-                    |Ping/Pong output mismatch
-                    |
-                    |cycle  = $cycle
-                    |Y      = $activeOutput
-                    |row    = $activeRow
-                    |column = $n
-                    |
-                    |expected =
-                    |${golden(activeOutput)(activeRow)(n)}
-                    |""".stripMargin
-                )
-            }
-
-        } else {
-
-            for (
-            n <- 0 until dim
-            ) {
-
-            dut.io.out_valid(n)
-                .expect(
-                false.B
-                )
-            }
-        }
-
-
-        dut.io.fatal_alert
-            .expect(false.B)
-
-        
-
-
-        // ======================================================================
-        // Clock
-        // ======================================================================
-
-        dut.clock.step(1)
-        }
-        }
-    }
-    it should "preserve Y0 Y1 Y2 ping-pong correctness across global stalls" in {
-
-  val dim         = 16
-  val numOutputs  = 3
-  val numKTiles   = 2
-  val totalTiles  = numOutputs * numKTiles
-
-  val rng =
-    new Random(0x6a5b4c3dL)
-
-  val aTiles =
-    Array.tabulate(
-      numOutputs,
-      numKTiles,
-      dim,
-      dim
-    ) { (_, _, _, _) =>
-      rng.nextInt(31) - 15
-    }
-
-  val wTiles =
-    Array.tabulate(
-      numOutputs,
-      numKTiles,
-      dim,
-      dim
-    ) { (_, _, _, _) =>
-      rng.nextInt(31) - 15
-    }
-
-  val golden =
-    Array.ofDim[Int](
-      numOutputs,
-      dim,
-      dim
-    )
-
-  for {
-    y <- 0 until numOutputs
-    m <- 0 until dim
-    n <- 0 until dim
-  } {
-    var sum = 0
-
-    for {
-      q <- 0 until numKTiles
-      k <- 0 until dim
-    } {
-      sum +=
-        aTiles(y)(q)(m)(k) *
-        wTiles(y)(q)(n)(k)
-    }
-
-    golden(y)(m)(n) = sum
-  }
-
-  test(
-    new TPU_top(
-      numRows = dim,
-      numCols = dim,
-      inBits  = 8,
-      accBits = 32
-    )
-  ) { dut =>
-
-    def driveInputZero(): Unit = {
-      for (k <- 0 until dim) {
+    def tileToYQ(globalTile: Int): (Int, Int) =
+      (
+        globalTile / numKTiles,
+        globalTile % numKTiles
+      )
+
+    def driveInputZero(): Unit =
+      for (k <- 0 until dim)
         dut.io.in_input(k).poke(0.S(8.W))
-      }
-    }
 
-    def driveWeightZero(): Unit = {
-      for (k <- 0 until dim) {
+    def driveWeightZero(): Unit =
+      for (k <- 0 until dim)
         dut.io.in_weight(k).poke(0.S(8.W))
-      }
-    }
 
-    def tileToYQ(globalTile: Int): (Int, Int) = {
-      val y = globalTile / numKTiles
-      val q = globalTile % numKTiles
-      (y, q)
-    }
-
-    def driveInputRow(
-      globalTile: Int,
-      m: Int
-    ): Unit = {
-
-      val (y, q) =
-        tileToYQ(globalTile)
-
-      for (k <- 0 until dim) {
+    def driveInputRow(globalTile: Int, m: Int): Unit = {
+      val (y, q) = tileToYQ(globalTile)
+      for (k <- 0 until dim)
         dut.io.in_input(k)
-          .poke(
-            aTiles(y)(q)(m)(k)
-              .S(8.W)
-          )
-      }
+          .poke(aTiles(y)(q)(m)(k).S(8.W))
     }
 
-    def driveWeightRow(
-      globalTile: Int,
-      n: Int
-    ): Unit = {
-
-      val (y, q) =
-        tileToYQ(globalTile)
-
-      for (k <- 0 until dim) {
+    def driveWeightRow(globalTile: Int, n: Int): Unit = {
+      val (y, q) = tileToYQ(globalTile)
+      for (k <- 0 until dim)
         dut.io.in_weight(k)
-          .poke(
-            wTiles(y)(q)(n)(k)
-              .S(8.W)
-          )
-      }
+          .poke(wTiles(y)(q)(n)(k).S(8.W))
     }
 
-    def snapshotCol0Cycle(
-      outputTile: Int
-    ): Int = {
+    def expectedParamUpdate(y: Int): Boolean =
+      (y % colNum) == 0
 
-      val lastGlobalTile =
-        (outputTile + 1) *
-        numKTiles -
-        1
+    def expectedNormChange(y: Int): Boolean =
+      (y % (normPhaseLoad + 1)) == 0
 
-      lastGlobalTile * dim +
-      dim +
-      (dim - 1)
-    }
+    def expectedFusionChange(y: Int): Boolean =
+      y >= 15 &&
+      ((y - 15) % 32) == 0
 
-    def snapshotAllColumnsDone(
-      outputTile: Int
-    ): Int = {
-
-      snapshotCol0Cycle(outputTile) +
-      (dim - 1)
-    }
-
-    def streamStartCycle(
-      outputTile: Int
-    ): Int = {
-
-      snapshotAllColumnsDone(outputTile) + 1
-    }
-
-    // ------------------------------------------------------------------------
-    // Initial state
-    // ------------------------------------------------------------------------
+    // ----------------------------------------------------------------------
+    // Initial configuration
+    // ----------------------------------------------------------------------
 
     driveInputZero()
     driveWeightZero()
@@ -890,453 +105,284 @@ class TPUTopTest
     dut.io.input_tile_start.poke(false.B)
     dut.io.weight_valid.poke(false.B)
 
-    dut.io.accum_en.poke(false.B)
-    dut.io.accum_first.poke(false.B)
-    dut.io.accum_snapshot.poke(false.B)
-    dut.io.accum_stream_en.poke(false.B)
+    dut.io.intermNum.poke(numKTiles.U(32.W))
+    dut.io.colNum.poke(colNum.U(32.W))
+    dut.io.norm_phase_load.poke(normPhaseLoad.U(32.W))
 
     dut.io.stall.poke(false.B)
     dut.io.clear_W.poke(true.B)
 
     dut.clock.step(1)
-
     dut.io.clear_W.poke(false.B)
 
-    // ========================================================================
-    // Initial W0 preload with stall support
-    // ========================================================================
+    // ----------------------------------------------------------------------
+    // Initial W0 preload
+    // ----------------------------------------------------------------------
 
-    var physicalCycle = 0
-    var preloadN      = 0
-
-    def stallPattern(p: Int): Boolean = {
-
-      // repeated 2-cycle stalls
-      val pair =
-        (p % 23 == 7) ||
-        (p % 23 == 8)
-
-      // additional single stall
-      val single =
-        p % 31 == 17
-
-      pair || single
-    }
-
-    while (preloadN < dim) {
-
-      val stallNow =
-        stallPattern(physicalCycle)
-
+    for (n <- 0 until dim) {
       driveInputZero()
-
       dut.io.input_valid.poke(false.B)
       dut.io.input_tile_start.poke(false.B)
 
-      driveWeightRow(
-        globalTile = 0,
-        n = preloadN
-      )
-
+      driveWeightRow(globalTile = 0, n = n)
       dut.io.weight_valid.poke(true.B)
 
-      dut.io.accum_en.poke(false.B)
-      dut.io.accum_first.poke(false.B)
-      dut.io.accum_snapshot.poke(false.B)
-      dut.io.accum_stream_en.poke(false.B)
-
-      dut.io.stall.poke(stallNow.B)
-
-      val beforeOut =
-        (0 until dim).map { n =>
-          dut.io.out_accum(n)
-            .peek()
-            .litValue
-        }
-
-      val beforeValid =
-        (0 until dim).map { n =>
-          dut.io.out_valid(n)
-            .peek()
-            .litToBoolean
-        }
-
-      dut.clock.step(1)
-
-      if (stallNow) {
-
-        val afterOut =
-          (0 until dim).map { n =>
-            dut.io.out_accum(n)
-              .peek()
-              .litValue
-          }
-
-        val afterValid =
-          (0 until dim).map { n =>
-            dut.io.out_valid(n)
-              .peek()
-              .litToBoolean
-          }
-
-        assert(
-          afterOut == beforeOut,
-          s"Output changed during preload stall at physicalCycle=$physicalCycle"
-        )
-
-        assert(
-          afterValid == beforeValid,
-          s"out_valid changed during preload stall at physicalCycle=$physicalCycle"
-        )
-
-      } else {
-
-        preloadN += 1
-      }
-
+      dut.io.stall.poke(false.B)
       dut.io.fatal_alert.expect(false.B)
 
-      physicalCycle += 1
+      dut.clock.step(1)
     }
 
     dut.io.weight_valid.poke(false.B)
 
-    // ========================================================================
-    // Logical timing
-    // ========================================================================
+    // ----------------------------------------------------------------------
+    // Autonomous execution
+    // ----------------------------------------------------------------------
 
-    val finalLogicalCycle =
-      streamStartCycle(
-        numOutputs - 1
-      ) +
-      dim -
-      1
+    val totalComputeCycles =
+      totalTiles * dim
+
+    val expectedOutputRows =
+      numOutputs * dim
 
     var logicalCycle = 0
+    var physicalCycle = 0
+    var outputRowsSeen = 0
+    var streamStarted = false
 
     while (
-      logicalCycle <= finalLogicalCycle
+      outputRowsSeen < expectedOutputRows &&
+      physicalCycle < 100000
     ) {
 
       val stallNow =
-        stallPattern(physicalCycle)
+        stallFn(physicalCycle)
 
-      // ======================================================================
-      // INPUT
-      // ======================================================================
+      // --------------------------------------------------------------------
+      // A stream
+      // --------------------------------------------------------------------
 
-      if (
-        logicalCycle <
-        totalTiles * dim
-      ) {
+      if (logicalCycle < totalComputeCycles) {
+        val globalTile = logicalCycle / dim
+        val m = logicalCycle % dim
 
-        val globalTile =
-          logicalCycle / dim
+        driveInputRow(globalTile, m)
 
-        val m =
-          logicalCycle % dim
-
-        driveInputRow(
-          globalTile = globalTile,
-          m = m
-        )
-
-        dut.io.input_valid
-          .poke(true.B)
-
-        dut.io.input_tile_start
-          .poke((m == 0).B)
+        dut.io.input_valid.poke(true.B)
+        dut.io.input_tile_start.poke((m == 0).B)
 
       } else {
-
         driveInputZero()
-
-        dut.io.input_valid
-          .poke(false.B)
-
-        dut.io.input_tile_start
-          .poke(false.B)
+        dut.io.input_valid.poke(false.B)
+        dut.io.input_tile_start.poke(false.B)
       }
 
-      // ======================================================================
-      // WEIGHT PRELOAD
-      // ======================================================================
+      // --------------------------------------------------------------------
+      // Rolling W preload
+      //
+      // W1 : cycles 15..30
+      // W2 : cycles 31..46
+      // ...
+      // --------------------------------------------------------------------
 
       val relativeWeightCycle =
-        logicalCycle -
-        (dim - 1)
+        logicalCycle - (dim - 1)
 
-      if (
-        relativeWeightCycle >= 0
-      ) {
-
-        val globalWeightTile =
-          1 +
-          relativeWeightCycle / dim
+      if (relativeWeightCycle >= 0) {
+        val nextGlobalTile =
+          1 + relativeWeightCycle / dim
 
         val n =
           relativeWeightCycle % dim
 
-        if (
-          globalWeightTile <
-          totalTiles
-        ) {
-
-          driveWeightRow(
-            globalTile =
-              globalWeightTile,
-            n = n
-          )
-
-          dut.io.weight_valid
-            .poke(true.B)
-
+        if (nextGlobalTile < totalTiles) {
+          driveWeightRow(nextGlobalTile, n)
+          dut.io.weight_valid.poke(true.B)
         } else {
-
           driveWeightZero()
-
-          dut.io.weight_valid
-            .poke(false.B)
+          dut.io.weight_valid.poke(false.B)
         }
 
       } else {
-
         driveWeightZero()
-
-        dut.io.weight_valid
-          .poke(false.B)
+        dut.io.weight_valid.poke(false.B)
       }
 
-      // ======================================================================
-      // ACCUM CONTROL
-      // ======================================================================
+      dut.io.stall.poke(stallNow.B)
 
-      val firstCapture =
-        dim
+      // --------------------------------------------------------------------
+      // Output scoreboard
+      // --------------------------------------------------------------------
 
-      val lastCapture =
-        totalTiles * dim +
-        dim -
-        1
+      val valid0 =
+        dut.io.out_valid(0)
+          .peek()
+          .litToBoolean
 
-      val accumActive =
-        logicalCycle >= firstCapture &&
-        logicalCycle <= lastCapture
+      if (stallNow) {
+        for (n <- 0 until dim)
+          dut.io.out_valid(n).expect(false.B)
 
-      dut.io.accum_en
-        .poke(accumActive.B)
+        dut.io.out_meta.param_update.expect(false.B)
+        dut.io.out_meta.fusion_change.expect(false.B)
+        dut.io.out_meta.norm_phase_change.expect(false.B)
 
-      val captureStreamIndex =
-        logicalCycle -
-        dim
+      } else if (valid0) {
 
-      val isFirstKTile =
-        if (
-          captureStreamIndex >= 0 &&
-          captureStreamIndex <
-            totalTiles * dim
-        ) {
+        val y =
+          outputRowsSeen / dim
 
-          val globalTile =
-            captureStreamIndex / dim
+        val m =
+          outputRowsSeen % dim
 
+        for (n <- 0 until dim) {
+          dut.io.out_valid(n).expect(true.B)
+          dut.io.out_accum(n).expect(
+            golden(y)(m)(n).S(32.W)
+          )
+        }
+
+        val firstRow =
+          m == 0
+
+        dut.io.out_meta.param_update.expect(
           (
-            globalTile %
-            numKTiles
-          ) == 0
+            firstRow &&
+            expectedParamUpdate(y)
+          ).B
+        )
 
-        } else {
+        dut.io.out_meta.fusion_change.expect(
+          (
+            firstRow &&
+            expectedFusionChange(y)
+          ).B
+        )
 
-          false
-        }
+        dut.io.out_meta.norm_phase_change.expect(
+          (
+            firstRow &&
+            expectedNormChange(y)
+          ).B
+        )
 
-      dut.io.accum_first
-        .poke(isFirstKTile.B)
+        outputRowsSeen += 1
+        streamStarted = true
 
-      val snapshotNow =
-        (0 until numOutputs)
-          .exists { y =>
-            logicalCycle ==
-            snapshotCol0Cycle(y)
-          }
+      } else {
 
-      dut.io.accum_snapshot
-        .poke(snapshotNow.B)
+        for (n <- 0 until dim)
+          dut.io.out_valid(n).expect(false.B)
 
-      // ======================================================================
-      // OUTPUT STREAM
-      // ======================================================================
-
-      var activeOutput = -1
-      var activeRow    = -1
-
-      for (
-        y <- 0 until numOutputs
-      ) {
-
-        val start =
-          streamStartCycle(y)
-
-        val end =
-          start +
-          dim -
-          1
+        dut.io.out_meta.param_update.expect(false.B)
+        dut.io.out_meta.fusion_change.expect(false.B)
+        dut.io.out_meta.norm_phase_change.expect(false.B)
 
         if (
-          logicalCycle >= start &&
-          logicalCycle <= end
+          requireNoBubble &&
+          streamStarted &&
+          outputRowsSeen < expectedOutputRows
         ) {
-
-          activeOutput = y
-          activeRow =
-            logicalCycle - start
+          fail(
+            s"Unexpected output bubble: " +
+            s"physical=$physicalCycle logical=$logicalCycle " +
+            s"rowsSeen=$outputRowsSeen"
+          )
         }
       }
 
-      val streamActive =
-        activeOutput >= 0
-
-      dut.io.accum_stream_en
-        .poke(streamActive.B)
-
-      // ======================================================================
-      // Apply global stall
-      // ======================================================================
-
-      dut.io.stall
-        .poke(stallNow.B)
-
-      // Save externally visible state before edge.
-      val beforeOut =
-        (0 until dim).map { n =>
-          dut.io.out_accum(n)
-            .peek()
-            .litValue
-        }
-
-      val beforeValid =
-        (0 until dim).map { n =>
-          dut.io.out_valid(n)
-            .peek()
-            .litToBoolean
-        }
-
-      // ======================================================================
-      // Check current logical output BEFORE stepping
-      // ======================================================================
-
-      if (
-        streamActive &&
-        !stallNow
-      ) {
-
-        for (
-          n <- 0 until dim
-        ) {
-
-          dut.io.out_valid(n)
-            .expect(true.B)
-
-          dut.io.out_accum(n)
-            .expect(
-              golden(
-                activeOutput
-              )(
-                activeRow
-              )(
-                n
-              ).S(32.W),
-
-              s"""
-                 |TPU stall test mismatch
-                 |
-                 |physicalCycle = $physicalCycle
-                 |logicalCycle  = $logicalCycle
-                 |
-                 |Y      = $activeOutput
-                 |row    = $activeRow
-                 |column = $n
-                 |
-                 |expected =
-                 |${golden(activeOutput)(activeRow)(n)}
-                 |""".stripMargin
-            )
-        }
-
-      } else if (!stallNow) {
-
-        for (
-          n <- 0 until dim
-        ) {
-          dut.io.out_valid(n)
-            .expect(false.B)
-        }
-      }
-
-      dut.io.fatal_alert
-        .expect(false.B)
-
-      // ======================================================================
-      // Clock
-      // ======================================================================
+      dut.io.fatal_alert.expect(false.B)
 
       dut.clock.step(1)
 
-      // ======================================================================
-      // Stall verification
-      //
-      // Entire externally-visible TPU state must remain frozen.
-      // ======================================================================
-
-      if (stallNow) {
-
-        val afterOut =
-          (0 until dim).map { n =>
-            dut.io.out_accum(n)
-              .peek()
-              .litValue
-          }
-
-        val afterValid =
-          (0 until dim).map { n =>
-            dut.io.out_valid(n)
-              .peek()
-              .litToBoolean
-          }
-
-        assert(
-          afterOut == beforeOut,
-          s"""
-             |out_accum changed during stall
-             |
-             |physicalCycle = $physicalCycle
-             |logicalCycle  = $logicalCycle
-             |""".stripMargin
-        )
-
-        assert(
-          afterValid == beforeValid,
-          s"""
-             |out_valid changed during stall
-             |
-             |physicalCycle = $physicalCycle
-             |logicalCycle  = $logicalCycle
-             |""".stripMargin
-        )
-
-      } else {
-
-        // Only non-stalled clocks advance architectural time.
+      if (!stallNow)
         logicalCycle += 1
-      }
 
       physicalCycle += 1
+    }
 
-      assert(
-        physicalCycle < 100000,
-        "TPU stall test exceeded maximum cycle count."
+    assert(
+      outputRowsSeen == expectedOutputRows,
+      s"Expected $expectedOutputRows output rows, " +
+      s"observed $outputRowsSeen"
+    )
+  }
+
+  it should "stream intermNum=1 output tiles with zero-bubble true ping-pong handoff and correct metadata" in {
+    val dim = 16
+
+    test(
+      new TPU_top(
+        numRows = dim,
+        numCols = dim,
+        inBits = 8,
+        accBits = 32
+      )
+    ) { dut =>
+      runScenario(
+        dut = dut,
+        dim = dim,
+        numOutputs = 20,
+        numKTiles = 1,
+        colNum = 4,
+        normPhaseLoad = 2,
+        seed = 0x10012002L,
+        stallFn = _ => false,
+        requireNoBubble = true
       )
     }
   }
-}
+
+  it should "correctly accumulate multiple K tiles with autonomous ComputeTimer control" in {
+    val dim = 16
+
+    test(
+      new TPU_top(
+        numRows = dim,
+        numCols = dim,
+        inBits = 8,
+        accBits = 32
+      )
+    ) { dut =>
+      runScenario(
+        dut = dut,
+        dim = dim,
+        numOutputs = 4,
+        numKTiles = 3,
+        colNum = 2,
+        normPhaseLoad = 1,
+        seed = 0x30042006L,
+        stallFn = _ => false,
+        requireNoBubble = false
+      )
+    }
+  }
+
+  it should "preserve true ping-pong output ordering and metadata across global stalls" in {
+    val dim = 16
+
+    test(
+      new TPU_top(
+        numRows = dim,
+        numCols = dim,
+        inBits = 8,
+        accBits = 32
+      )
+    ) { dut =>
+      runScenario(
+        dut = dut,
+        dim = dim,
+        numOutputs = 8,
+        numKTiles = 1,
+        colNum = 4,
+        normPhaseLoad = 2,
+        seed = 0x55aa77ccL,
+        stallFn = p =>
+          (p % 19 == 5) ||
+          (p % 19 == 6) ||
+          (p % 37 == 11),
+        requireNoBubble = true
+      )
+    }
+  }
 }

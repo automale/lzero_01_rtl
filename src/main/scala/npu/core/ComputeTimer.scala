@@ -22,15 +22,9 @@ import chisel3.util._
 // Only events whose meaning changes with the data stream are carried.
 // ============================================================================
 class TPUStreamMeta extends Bundle {
-
   val param_update = Bool()
-
-  val fusion_change = Bool()
-
-  val norm_phase_change = Bool()
-  
+  val fusion_req = Bool()
 }
-
 
 // ============================================================================
 // Compute Timer
@@ -71,11 +65,8 @@ class ComputeTimer(
     // ------------------------------------------------------------------------
     // Datapath progress
     // ------------------------------------------------------------------------
-
     val row0_valid = Input(Bool())
-
     val stall = Input(Bool())
-
 
     // ------------------------------------------------------------------------
     // Operation dimensions
@@ -86,13 +77,8 @@ class ComputeTimer(
     // colNum:
     //   number of output-column tiles in one logical output row
     // ------------------------------------------------------------------------
-
     val intermNum = Input(UInt(32.W))
-
     val colNum = Input(UInt(32.W))
-
-    val norm_phase_load = Input(UInt(32.W))
-
 
     // ------------------------------------------------------------------------
     // Accumulator logical control
@@ -120,12 +106,8 @@ class ComputeTimer(
     //
     // Valid only together with output_tile_done.
     // ------------------------------------------------------------------------
-
     val param_update = Output(Bool())
-
-    val fusion_change = Output(Bool())
-
-    val norm_phase_change = Output(Bool())
+    val fusion_req = Output(Bool())
   })
 
 
@@ -188,14 +170,6 @@ class ComputeTimer(
   val fusionCounter = RegInit(15.U(32.W))
 
   // ==========================================================================
-  // Normalizer phase counter
-  //
-  // initial = 0
-  // reload  = norm_phase_load
-  // ==========================================================================
-  val normCounter = RegInit(0.U(32.W))
-
-  // ==========================================================================
   // Current logical state
   // ==========================================================================
   val lastRow = rowCounter === (tileSize - 1).U
@@ -219,7 +193,7 @@ class ComputeTimer(
   // ==========================================================================
   io.param_update := outputTileDone && (colTileCounter === 0.U)
 
-  io.fusion_change := outputTileDone && (fusionCounter === 0.U)
+  io.fusion_req := outputTileDone && (fusionCounter === 0.U)
 
   io.norm_phase_change := outputTileDone && (normCounter === 0.U)
 
