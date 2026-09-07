@@ -239,10 +239,10 @@ class TPU_top(
   // Row-level RoPE metadata enqueue
   // ==========================================================================
   ropeRowMetaQueue.io.enq.valid :=
-    timer.io.rope_param_update
+    timer.io.row_change_update
 
   ropeRowMetaQueue.io.enq.bits :=
-    timer.io.rope_param_update
+    timer.io.row_change_update
 
   // ==========================================================================
   // Accumulator output
@@ -294,7 +294,7 @@ class TPU_top(
   //
   // Exactly one row-tag is consumed for every flat output row.
   // ==========================================================================
-  io.out_meta.rope_param_update :=
+  io.out_meta.row_change_update :=
     outputRowValid &&
     ropeRowMetaQueue.io.deq.valid &&
     ropeRowMetaQueue.io.deq.bits
@@ -314,7 +314,7 @@ class TPU_top(
     !tileCtrlQueue.io.deq.valid
 
   val rowMetaOverflow =
-    timer.io.rope_param_update &&
+    timer.io.row_change_update &&
     !ropeRowMetaQueue.io.enq.ready
 
   val rowMetaUnderflow =

@@ -368,7 +368,7 @@ class TPUTopTest
 
       val ropeNow =
         dut.io.out_meta
-          .rope_param_update
+          .row_change_update
           .peek()
           .litToBoolean
 
@@ -392,7 +392,7 @@ class TPUTopTest
           .expect(false.B)
 
         dut.io.out_meta
-          .rope_param_update
+          .row_change_update
           .expect(false.B)
 
         dut.io.fusion_req
@@ -435,7 +435,7 @@ class TPUTopTest
           // --------------------------------------------------------------
           assert(
             ropeNow,
-            s"rope_param_update missing: physical=$physicalCycle tile=$outputTile row=$row"
+            s"row_change_update missing: physical=$physicalCycle tile=$outputTile row=$row"
           )
 
           ropePulseCount += 1
@@ -491,7 +491,7 @@ class TPUTopTest
 
           assert(
             !ropeNow,
-            s"rope_param_update asserted without output valid at physical=$physicalCycle"
+            s"row_change_update asserted without output valid at physical=$physicalCycle"
           )
 
           if(
@@ -540,7 +540,7 @@ class TPUTopTest
     assert(
       ropePulseCount ==
       expectedOutputRows,
-      s"Expected $expectedOutputRows rope_param_update pulses, got $ropePulseCount"
+      s"Expected $expectedOutputRows row_change_update pulses, got $ropePulseCount"
     )
 
     val expectedQuantCount =

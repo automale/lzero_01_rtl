@@ -10,13 +10,13 @@ import chisel3.util._
 //   Quant parameter context change.
 //   Policy is independently configurable.
 //
-// rope_param_update:
+// row_change_update:
 //   RoPE logical-position parameter change.
 //   One pulse per completed output row.
 // ============================================================================
 class TPUStreamMeta extends Bundle {
   val quant_param_update = Bool()
-  val rope_param_update  = Bool()
+  val row_change_update  = Bool()
 }
 
 // Per-output-tile control which must survive until the accumulator
@@ -60,7 +60,7 @@ class ComputeTimer(
 
     // Dynamic metadata
     val quant_param_update = Output(Bool())
-    val rope_param_update  = Output(Bool())
+    val row_change_update  = Output(Bool())
 
     // Lookahead control
     val fusion_req = Output(Bool())
@@ -124,7 +124,7 @@ class ComputeTimer(
     fire &&
     lastKTile
 
-  io.rope_param_update :=
+  io.row_change_update :=
     outputRowDone
 
   // --------------------------------------------------------------------------
