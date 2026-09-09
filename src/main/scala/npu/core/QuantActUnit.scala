@@ -4,209 +4,353 @@ import chisel3._
 import chisel3.util._
 import npu.utils.Universal_Wide_LUT
 
-// [1] QuantAct Core (4-Stage Pipeline)
-class QuantActCore (
-  val writeBits: Int, // 256
-  val indexBits: Int, // 10
-  val inBits: Int,    // 32
-  val outBits: Int    // 8
+object QuantParamMode {
+  val PER_MATRIX  = 0.U(1.W)
+  val PER_CHANNEL = 1.U(1.W)
+}
+
+// One lane of the existing packed requant + optional activation pipeline.
+// Packed parameter format is preserved:
+//   [31:16] multiplier
+//   [15:13] reserved
+//   [12:8]  shift
+//   [7:0]   zero-point
+class QuantActCore(
+  val writeBits: Int,
+  val indexBits: Int,
+  val inBits: Int,
+  val outBits: Int
 ) extends Module {
-  
-  val numEntries = 1 << indexBits
-  val wordsPerBurst = writeBits / outBits
-  val burstAddrBits = log2Ceil(numEntries / wordsPerBurst)
+
+  private val numEntries = 1 << indexBits
+  private val wordsPerBurst = writeBits / outBits
+  private val burstAddrBits =
+    math.max(1, log2Ceil(numEntries / wordsPerBurst))
 
   val io = IO(new Bundle {
-    val in_mac      = Input(UInt(inBits.W))
-    val param       = Input(UInt(inBits.W)) // [31:16] M, [12:8] S, [7:0] ZP
-    val act_en      = Input(Bool())     
-    
-    val stall       = Input(Bool())
+    val in_mac   = Input(SInt(inBits.W))
+    val in_valid = Input(Bool())
+    val param    = Input(UInt(32.W))
+    val act_en   = Input(Bool())
+    val stall    = Input(Bool())
 
-    // --- LUT Programming Port ---
     val lut_wr_en   = Input(Bool())
     val lut_wr_addr = Input(UInt(burstAddrBits.W))
     val lut_wr_data = Input(Vec(wordsPerBurst, UInt(outBits.W)))
 
-    val out_qact    = Output(UInt(outBits.W))
+    val out_qact  = Output(UInt(outBits.W))
+    val out_valid = Output(Bool())
 
-    // --- Orchestrator 상태 보고용 포트 ---
-    val lut_ready   = Output(Bool()) // 프로그래밍 완료 신호
-    val sync_alert  = Output(Bool()) // Read/Write 타이밍 오류 발생 시 High
+    val lut_ready  = Output(Bool())
+    val sync_alert = Output(Bool())
   })
 
   val run = !io.stall
+  val accept = io.in_valid && run
 
-  // 파라미터 분리
   val zp    = io.param(7, 0).asSInt
-  val shift = io.param(12, 8).asUInt
-  val mult  = io.param(31, 16).asUInt
+  val shift = io.param(12, 8)
+  val mult  = io.param(31, 16)
 
-  // -----------------------------------------------------
-  // [Stage 1] Subtraction (영점 조정)
-  // -----------------------------------------------------
-  val s1_sub    = RegEnable(io.in_mac.asSInt.pad(33) - zp.pad(33), run)
-  val s1_mult   = RegEnable(mult, run)
-  val s1_shift  = RegEnable(shift, run)
-  val s1_act_en = RegEnable(io.act_en, run)
+  val s1Sub    = Reg(SInt((inBits + 1).W))
+  val s1Mult   = Reg(UInt(16.W))
+  val s1Shift  = Reg(UInt(5.W))
+  val s1ActEn  = Reg(Bool())
+  val s1Valid  = RegInit(false.B)
 
-  // -----------------------------------------------------
-  // [Stage 2] Multiplication (스케일링 곱셈)
-  // -----------------------------------------------------
-  val s2_mult_res = RegEnable(s1_sub * s1_mult.zext.asSInt, run)
-  val s2_shift    = RegEnable(s1_shift, run)
-  val s2_act_en   = RegEnable(s1_act_en, run)
+  when(run) {
+    s1Valid := io.in_valid
+    when(io.in_valid) {
+      s1Sub   := io.in_mac.pad(inBits + 1) - zp.pad(inBits + 1)
+      s1Mult  := mult
+      s1Shift := shift
+      s1ActEn := io.act_en
+    }
+  }
 
-  // -----------------------------------------------------
-  // [Stage 3] Shift & Clamping (10-bit 인덱스 생성)
-  // -----------------------------------------------------
-  val max_idx = (1 << indexBits) - 1 
-  
-  val shift_res   = (s2_mult_res >> (s2_shift - 2.U)).asSInt 
-  val clamped_idx = Mux(shift_res < 0.S, 0.U(indexBits.W), 
-                        Mux(shift_res > max_idx.S, max_idx.U(indexBits.W), 
-                        shift_res(indexBits - 1, 0).asUInt)) 
-                        
-  val s3_idx           = RegEnable(clamped_idx, run)
-  val s3_linear_bypass = RegEnable(clamped_idx(indexBits - 1, indexBits - outBits), run) 
-  val s3_act_en        = RegEnable(s2_act_en, run)
+  val s2MultRes = Reg(SInt((inBits + 17).W))
+  val s2Shift   = Reg(UInt(5.W))
+  val s2ActEn   = Reg(Bool())
+  val s2Valid   = RegInit(false.B)
 
-  // -----------------------------------------------------
-  // [Stage 4] BRAM LUT Read & Handshake Monitoring
-  // -----------------------------------------------------
-  val act_lut = Module(new Universal_Wide_LUT(
-    indexBits = indexBits, 
-    outBits  = outBits, 
-    writeBits = writeBits
-  ))
-  
-  // LUT Programming 입력
-  act_lut.io.wr_en   := io.lut_wr_en
-  act_lut.io.wr_addr := io.lut_wr_addr
-  act_lut.io.wr_data := io.lut_wr_data
-  
-  // LUT Read 입력 (파이프라인이 멈추면 Read도 멈춤)
-  act_lut.io.rd_en   := run 
-  act_lut.io.rd_addr := s3_idx 
+  when(run) {
+    s2Valid := s1Valid
+    when(s1Valid) {
+      s2MultRes := s1Sub * s1Mult.zext.asSInt
+      s2Shift   := s1Shift
+      s2ActEn   := s1ActEn
+    }
+  }
 
-  // --- Sync 모니터링 로직 ---
-  
-  // 1. Read Sync Check: rd_en이 나간 1클럭 뒤에 정확히 rd_valid가 뜨는지 비교
-  val expected_rd_valid = RegNext(act_lut.io.rd_en, false.B)
-  val rd_sync_err       = expected_rd_valid =/= act_lut.io.rd_valid
+  val maxIdx = ((BigInt(1) << indexBits) - 1).U(indexBits.W)
+  val shiftAmt = Mux(s2Shift > 2.U, s2Shift - 2.U, 0.U)
+  val shifted = (s2MultRes >> shiftAmt).asSInt
 
-  // 2. Write Sync Check: wr_en이 나간 1클럭 뒤에 정확히 wr_valid가 뜨는지 비교
-  val expected_wr_valid = RegNext(act_lut.io.wr_en, false.B)
-  val wr_sync_err       = expected_wr_valid =/= act_lut.io.wr_valid
+  val clampedIdx =
+    Mux(
+      shifted < 0.S,
+      0.U(indexBits.W),
+      Mux(
+        shifted > maxIdx.zext.asSInt,
+        maxIdx,
+        shifted(indexBits - 1, 0).asUInt
+      )
+    )
 
-  // 하나라도 타이밍이 어긋나면 외부(Control)로 Alert 발송
-  io.sync_alert := rd_sync_err || wr_sync_err
-  
-  // 상태 신호 Bypass
-  io.lut_ready  := act_lut.io.lut_ready
+  val s3Idx = Reg(UInt(indexBits.W))
+  val s3Linear = Reg(UInt(outBits.W))
+  val s3ActEn = Reg(Bool())
+  val s3Valid = RegInit(false.B)
 
-  // -----------------------------------------------------
-  // [최종 MUX]
-  // -----------------------------------------------------
-  val s4_linear_bypass = RegEnable(s3_linear_bypass, run)
-  val s4_act_en        = RegEnable(s3_act_en, run)
+  when(run) {
+    s3Valid := s2Valid
+    when(s2Valid) {
+      s3Idx := clampedIdx
+      s3Linear := clampedIdx(indexBits - 1, indexBits - outBits)
+      s3ActEn := s2ActEn
+    }
+  }
 
-  io.out_qact := Mux(s4_act_en, act_lut.io.rd_data, s4_linear_bypass)
+  val actLut =
+    Module(new Universal_Wide_LUT(
+      indexBits = indexBits,
+      dataBits = outBits,
+      writeBits = writeBits
+    ))
+
+  actLut.io.wr_en   := io.lut_wr_en
+  actLut.io.wr_addr := io.lut_wr_addr
+  actLut.io.wr_data := io.lut_wr_data
+
+  val actReq = s3Valid && s3ActEn && run
+  val linearReq = s3Valid && !s3ActEn && run
+
+  actLut.io.rd_en   := actReq
+  actLut.io.rd_addr := s3Idx
+
+  val linearDataD1 = RegEnable(s3Linear, 0.U, linearReq)
+  val linearValidD1 = RegNext(linearReq, false.B)
+
+  val rawValid = actLut.io.rd_valid || linearValidD1
+  val rawData = Mux(actLut.io.rd_valid, actLut.io.rd_data, linearDataD1)
+
+  // A LUT response can arrive in the first wall-clock stall cycle after an
+  // issued request. Retain it until the pipeline resumes.
+  val holdValid = RegInit(false.B)
+  val holdData  = Reg(UInt(outBits.W))
+
+  when(io.stall && rawValid && !holdValid) {
+    holdValid := true.B
+    holdData := rawData
+  }.elsewhen(run && holdValid) {
+    holdValid := false.B
+  }
+
+  io.out_qact := Mux(holdValid, holdData, rawData)
+  io.out_valid := run && (holdValid || rawValid)
+
+  val expectedRdValid = RegNext(actReq, false.B)
+  val expectedWrValid = RegNext(io.lut_wr_en, false.B)
+
+  io.sync_alert :=
+    (expectedRdValid =/= actLut.io.rd_valid) ||
+    (expectedWrValid =/= actLut.io.wr_valid) ||
+    (holdValid && rawValid && run)
+
+  io.lut_ready := actLut.io.lut_ready
 }
 
-// [2] 16 Row Universal VPU QuantActUnit
-class QuantActUnit (
-  val numLines: Int,  // 16 
-  val writeBits: Int, // 256
-  val indexBits: Int, // 10
-  val inBits: Int,    // 32
-  val outBits: Int    // 8
+// ============================================================================
+// 16-lane Quant/Act Unit
+//
+// PER_MATRIX:
+//   One 32-bit packed parameter from npu_struct is broadcast to all 16 lanes.
+//   QB is not accessed.
+//
+// PER_CHANNEL:
+//   QB supplies one 64-byte line = 16 x 32-bit channel parameters.
+//   active[16] serves the current 16-column output tile.
+//   shadow[16] prefetches the next tile.
+//   Every 16 accepted input rows, shadow -> active and the next QB line is
+//   requested. QB circular addressing is responsible for N-wrap/reuse.
+// ============================================================================
+class QuantActUnit(
+  val numLines: Int = 16,
+  val writeBits: Int = 256,
+  val indexBits: Int = 10,
+  val inBits: Int = 32,
+  val outBits: Int = 8
 ) extends Module {
-  
-  val wordsPerBurst = writeBits / outBits
-  val burstAddrBits = log2Ceil((1 << indexBits) / wordsPerBurst)
-  val paramAddrBits = log2Ceil(numLines).max(1) 
+
+  require(numLines == 16)
+
+  private val wordsPerBurst = writeBits / outBits
+  private val burstAddrBits =
+    math.max(1, log2Ceil((1 << indexBits) / wordsPerBurst))
 
   val io = IO(new Bundle {
-    val in_vec            = Input(Vec(numLines, UInt(inBits.W)))
-    val in_valid          = Input(Vec(numLines, Bool()))
-    val act_en = Input(Bool())
-    
-    val stall             = Input(Bool())
+    val in_vec   = Input(Vec(numLines, SInt(inBits.W)))
+    val in_valid = Input(Vec(numLines, Bool()))
 
-    // --- Parameter Loading Ports (Background) ---
-    val param_wr_en   = Input(Bool())
-    val param_wr_addr = Input(UInt(paramAddrBits.W)) 
-    val param_in      = Input(UInt(32.W))
+    val param_mode   = Input(UInt(1.W))
+    val matrix_param = Input(UInt(32.W))
+    val act_en       = Input(Bool())
 
-    // --- Parameter Update Port (Foreground Context Switch) ---
-    val param_update  = Input(Bool()) // Control이 타일 변경 시 1클럭 High로 쏴줌
+    val stall      = Input(Bool())
+    val soft_reset = Input(Bool())
 
-    val lut_wr_en     = Input(Bool())
-    val lut_wr_addr   = Input(UInt(burstAddrBits.W)) 
-    val lut_wr_data   = Input(Vec(wordsPerBurst, UInt(outBits.W)))
+    // QB 64-byte line interface.
+    val qparam_req_line = Output(Bool())
+    val qparam_line_in = Input(Vec(numLines, UInt(32.W)))
+    val qparam_line_valid = Input(Bool())
 
-    val out_vec       = Output(Vec(numLines, UInt(outBits.W)))
-    val out_valid     = Output(Vec(numLines, Bool()))
+    val lut_wr_en   = Input(Bool())
+    val lut_wr_addr = Input(UInt(burstAddrBits.W))
+    val lut_wr_data = Input(Vec(wordsPerBurst, UInt(outBits.W)))
 
-    // --- Orchestrator 상태 보고용 포트 ---
-    val lut_ready     = Output(Bool()) // 프로그래밍 완료 신호
-    val sync_alert    = Output(Bool()) // 코어 중 하나라도 에러가 나면 High
+    val out_vec   = Output(Vec(numLines, UInt(outBits.W)))
+    val out_valid = Output(Vec(numLines, Bool()))
+
+    // Initializer barrier/status.
+    val prefetch_ready = Output(Bool())
+    val lut_ready      = Output(Bool())
+    val sync_alert     = Output(Bool())
   })
 
-  // ====================================================================
-  // 1. Shadow Registers (백그라운드에서 DMA/Control이 천천히 채워 넣는 공간)
-  // ====================================================================
-  val shadow_param_regs = RegInit(VecInit(Seq.fill(numLines)(0.U(32.W))))
-  when (io.param_wr_en) {
-    shadow_param_regs(io.param_wr_addr) := io.param_in
-  }
-
-  // ====================================================================
-  // 2. Active Registers (실제 파이프라인이 바라보는 공간)
-  // ====================================================================
-  val active_param_regs = RegInit(VecInit(Seq.fill(numLines)(0.U(32.W))))
-  when (io.param_update) {
-    active_param_regs := shadow_param_regs
-  }
-
-  // ====================================================================
-  // 코어 인스턴스화 및 데이터 패스 매핑
-  // ====================================================================
-  val cores = Seq.fill(numLines)(Module(new QuantActCore(
-    writeBits = writeBits,
-    indexBits = indexBits,
-    outBits  = outBits
-  )))
-
   val run = !io.stall
+  val perChannel = io.param_mode === QuantParamMode.PER_CHANNEL
 
-  for (r <- 0 until numLines) {
-    cores(r).io.in_mac := io.in_vec(r)
-    cores(r).io.param  := active_param_regs(r)
-    cores(r).io.act_en := io.act_en
-    cores(r).io.stall  := io.stall 
+  val anyValid = io.in_valid.asUInt.orR
+  val allValid = io.in_valid.asUInt.andR
+  val inputFire = allValid && run
 
-    cores(r).io.lut_wr_en   := io.lut_wr_en
-    cores(r).io.lut_wr_addr := io.lut_wr_addr
-    cores(r).io.lut_wr_data := io.lut_wr_data
+  val rowCounter = RegInit(0.U(4.W))
+  val tileStart = inputFire && (rowCounter === 0.U)
+  val tileEnd   = inputFire && (rowCounter === 15.U)
 
-    io.out_vec(r) := cores(r).io.out_qact
-    
-    val valid_s1 = RegEnable(io.in_valid(r), false.B, run)
-    val valid_s2 = RegEnable(valid_s1,       false.B, run)
-    val valid_s3 = RegEnable(valid_s2,       false.B, run)
-    val valid_s4 = RegEnable(valid_s3,       false.B, run)
-    
-    io.out_valid(r) := valid_s4
+  when(io.soft_reset) {
+    rowCounter := 0.U
+  }.elsewhen(inputFire) {
+    when(tileEnd) {
+      rowCounter := 0.U
+    }.otherwise {
+      rowCounter := rowCounter + 1.U
+    }
   }
 
-  // ====================================================================
-  // 상태 및 에러 신호 통합 (Aggregation)
-  // ====================================================================
-  // 1. sync_alert: 16개 코어 중 단 하나라도 1을 띄우면 최종 출력도 1이 됨 (Bitwise OR Reduction)
-  io.sync_alert := VecInit(cores.map(_.io.sync_alert)).asUInt.orR
-  
-  // 2. lut_ready: 모든 코어가 동일한 브로드캐스트 프로그래밍 신호를 받으므로, 0번 코어의 상태만 대표로 출력
-  io.lut_ready := cores(0).io.lut_ready
+  val activeParam =
+    RegInit(VecInit(Seq.fill(numLines)(0.U(32.W))))
+
+  val shadowParam =
+    RegInit(VecInit(Seq.fill(numLines)(0.U(32.W))))
+
+  val activeValid = RegInit(false.B)
+  val shadowValid = RegInit(false.B)
+  val reqOutstanding = RegInit(false.B)
+
+  // Initial line is pulled before data starts. On each tileStart the currently
+  // prefetched line is consumed and the following line is requested immediately.
+  val consumeShadow =
+    perChannel && tileStart
+
+  io.qparam_req_line :=
+    perChannel &&
+    !reqOutstanding &&
+    (!shadowValid || consumeShadow)
+
+  when(io.soft_reset) {
+    activeValid := false.B
+    shadowValid := false.B
+    reqOutstanding := false.B
+  }.otherwise {
+    when(io.qparam_req_line) {
+      reqOutstanding := true.B
+    }
+
+    when(consumeShadow) {
+      when(shadowValid) {
+        activeParam := shadowParam
+        activeValid := true.B
+      }
+      shadowValid := false.B
+    }
+
+    // Response priority allows same-cycle refill after a consume event.
+    when(io.qparam_line_valid) {
+      shadowParam := io.qparam_line_in
+      shadowValid := true.B
+      reqOutstanding := false.B
+    }
+  }
+
+  // Update-cycle bypass: row0 of a new tile uses shadow directly.
+  val effectiveParam =
+    Wire(Vec(numLines, UInt(32.W)))
+
+  for (i <- 0 until numLines) {
+    effectiveParam(i) :=
+      Mux(
+        perChannel,
+        Mux(tileStart, shadowParam(i), activeParam(i)),
+        io.matrix_param
+      )
+  }
+
+  val primed = RegInit(false.B)
+  when(io.soft_reset || !perChannel) {
+    primed := false.B
+  }.elsewhen(shadowValid) {
+    primed := true.B
+  }
+
+  val cores =
+    Seq.fill(numLines)(
+      Module(new QuantActCore(
+        writeBits = writeBits,
+        indexBits = indexBits,
+        inBits = inBits,
+        outBits = outBits
+      ))
+    )
+
+  for (i <- 0 until numLines) {
+    cores(i).io.in_mac := io.in_vec(i)
+    cores(i).io.in_valid := io.in_valid(i)
+    cores(i).io.param := effectiveParam(i)
+    cores(i).io.act_en := io.act_en
+    cores(i).io.stall := io.stall
+
+    cores(i).io.lut_wr_en := io.lut_wr_en
+    cores(i).io.lut_wr_addr := io.lut_wr_addr
+    cores(i).io.lut_wr_data := io.lut_wr_data
+
+    io.out_vec(i) := cores(i).io.out_qact
+    io.out_valid(i) := cores(i).io.out_valid
+  }
+
+  io.lut_ready :=
+    VecInit(cores.map(_.io.lut_ready)).asUInt.andR
+
+  io.prefetch_ready :=
+    !perChannel || (primed && io.lut_ready)
+
+  val coreAlert =
+    VecInit(cores.map(_.io.sync_alert)).asUInt.orR
+
+  val laneMismatch = anyValid && !allValid
+  val firstTileWithoutShadow = consumeShadow && !shadowValid
+  val laterTileWithoutActive =
+    perChannel && inputFire && !tileStart && !activeValid
+
+  val unexpectedResponse =
+    io.qparam_line_valid &&
+    shadowValid &&
+    !consumeShadow
+
+  io.sync_alert :=
+    coreAlert ||
+    laneMismatch ||
+    firstTileWithoutShadow ||
+    laterTileWithoutActive ||
+    unexpectedResponse
 }

@@ -43,6 +43,32 @@ tpu-test:
 	  'set Test / unmanagedSources ~= (_.filter(_.getName == "TPU_Test.scala"))' \
 	  'testOnly npu.top.TPUTopTest'
 
+norm-test:
+	docker exec -it lzero_rtl_env sbt \
+	  'set Compile / unmanagedSources ~= (_.filter(f => f.getName == "UniversalLUT.scala" || f.getName == "NormUnit.scala"))' \
+	  'set Test / unmanagedSources ~= (_.filter(_.getName == "NormUnit_Test.scala"))' \
+	  'testOnly npu.core.NormUnitOnlineTest'
+
+norm-distributed-test:
+	docker exec -it lzero_rtl_env sbt \
+	  'set Compile / unmanagedSources ~= (_.filter(f => f.getName == "UniversalLUT.scala" || f.getName == "NormUnit.scala"))' \
+	  'set Test / unmanagedSources ~= (_.filter(_.getName == "NormUnit_Distributed_Test.scala"))' \
+	  'testOnly npu.core.NormUnitDistributedTest'
+	  # 'testOnly npu.core.NormUnitDistributedTest -- -z "preserve distributed Softmax correction"'
+	  # 'testOnly npu.core.NormUnitDistributedTest -- -z "padded distributed Milakov Softmax"'
+
+rope-test:
+	docker exec -it lzero_rtl_env sbt \
+	  'set Compile / unmanagedSources ~= (_.filter(f => Set("Rope.scala", "UniversalLUT.scala").contains(f.getName)))' \
+	  'set Test / unmanagedSources ~= (_.filter(_.getName == "Rope_Test.scala"))' \
+	  'testOnly npu.core.RopeUnitTest'
+
+quant-test:
+	docker exec -it lzero_rtl_env sbt \
+	  'set Compile / unmanagedSources ~= (_.filter(f => Set("QuantActUnit.scala", "UniversalLUT.scala").contains(f.getName)))' \
+	  'set Test / unmanagedSources ~= (_.filter(_.getName == "QuantAct_Test.scala"))' \
+	  'testOnly npu.core.QuantActUnitTest'
+
 # 5. 종료
 down:
 	docker compose down
