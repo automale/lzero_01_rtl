@@ -9,7 +9,7 @@ object QuantParamMode {
   val PER_CHANNEL = 1.U(1.W)
 }
 
-// One lane of the existing packed requant + optional activation pipeline.
+// Signed requant + optional activation. See docs/GPALU_QuantAct.md for numeric ABI.
 // Packed parameter format is preserved:
 //   [31:16] multiplier
 //   [15:13] reserved
@@ -22,6 +22,9 @@ class QuantActCore(
   val outBits: Int
 ) extends Module {
 
+  require(inBits >= math.max(outBits, 8) && outBits >= 2)
+  require(indexBits >= outBits && indexBits - outBits <= 4)
+  private val fracBits = indexBits - outBits
   private val numEntries = 1 << indexBits
   private val wordsPerBurst = writeBits / outBits
   private val burstAddrBits =
@@ -31,6 +34,8 @@ class QuantActCore(
     val in_mac   = Input(SInt(inBits.W))
     val in_valid = Input(Bool())
     val param    = Input(UInt(32.W))
+    // false: input is already in output-scale integer units; skip qparams.
+    val quant_en = Input(Bool())
     val act_en   = Input(Bool())
     val stall    = Input(Bool())
 
@@ -46,7 +51,6 @@ class QuantActCore(
   })
 
   val run = !io.stall
-  val accept = io.in_valid && run
 
   val zp    = io.param(7, 0).asSInt
   val shift = io.param(12, 8)
@@ -61,9 +65,9 @@ class QuantActCore(
   when(run) {
     s1Valid := io.in_valid
     when(io.in_valid) {
-      s1Sub   := io.in_mac.pad(inBits + 1) - zp.pad(inBits + 1)
-      s1Mult  := mult
-      s1Shift := shift
+      s1Sub   := Mux(io.quant_en, io.in_mac.pad(inBits + 1) - zp.pad(inBits + 1), io.in_mac.pad(inBits + 1))
+      s1Mult  := Mux(io.quant_en, mult, 1.U)
+      s1Shift := Mux(io.quant_en, shift, 0.U)
       s1ActEn := io.act_en
     }
   }
@@ -82,20 +86,22 @@ class QuantActCore(
     }
   }
 
-  val maxIdx = ((BigInt(1) << indexBits) - 1).U(indexBits.W)
-  val shiftAmt = Mux(s2Shift > 2.U, s2Shift - 2.U, 0.U)
-  val shifted = (s2MultRes >> shiftAmt).asSInt
+  // One shared barrel shifter. Preserve fractional bits for the LUT; dropping
+  // them afterwards gives exactly floor(P / 2^S) for the linear path as well.
+  // Left shift first so parameter shifts 0 and 1 retain the correct scaling.
+  val fixed = (s2MultRes << fracBits) >> s2Shift
+  val linear = fixed >> fracBits
+  // Linear output uses signed saturation, never unsigned clipping/wraparound.
+  val minOut = (-(BigInt(1) << (outBits - 1))).S
+  val maxOut = ((BigInt(1) << (outBits - 1)) - 1).S
+  val clampedLinear = Mux(linear < minOut, minOut, Mux(linear > maxOut, maxOut, linear))
 
-  val clampedIdx =
-    Mux(
-      shifted < 0.S,
-      0.U(indexBits.W),
-      Mux(
-        shifted > maxIdx.zext.asSInt,
-        maxIdx,
-        shifted(indexBits - 1, 0).asUInt
-      )
-    )
+  val minFixed = (-(BigInt(1) << (indexBits - 1))).S
+  val maxFixed = ((BigInt(1) << (indexBits - 1)) - 1).S
+  val clampedFixed = Mux(fixed < minFixed, minFixed, Mux(fixed > maxFixed, maxFixed, fixed))
+  // Offset binary: address 0 = -128, 512 = 0 for the default 10-bit table.
+  val biased = clampedFixed + (BigInt(1) << (indexBits - 1)).S
+  val clampedIdx = biased.asUInt(indexBits - 1, 0)
 
   val s3Idx = Reg(UInt(indexBits.W))
   val s3Linear = Reg(UInt(outBits.W))
@@ -106,7 +112,7 @@ class QuantActCore(
     s3Valid := s2Valid
     when(s2Valid) {
       s3Idx := clampedIdx
-      s3Linear := clampedIdx(indexBits - 1, indexBits - outBits)
+      s3Linear := clampedLinear.asUInt(outBits - 1, 0)
       s3ActEn := s2ActEn
     }
   }
@@ -194,6 +200,7 @@ class QuantActUnit(
 
     val param_mode   = Input(UInt(1.W))
     val matrix_param = Input(UInt(32.W))
+    val quant_en     = Input(Bool())
     val act_en       = Input(Bool())
 
     val stall      = Input(Bool())
@@ -218,11 +225,11 @@ class QuantActUnit(
   })
 
   val run = !io.stall
-  val perChannel = io.param_mode === QuantParamMode.PER_CHANNEL
+  val perChannel = io.quant_en && io.param_mode === QuantParamMode.PER_CHANNEL
 
   val anyValid = io.in_valid.asUInt.orR
   val allValid = io.in_valid.asUInt.andR
-  val inputFire = allValid && run
+  val inputFire = allValid && run && io.quant_en && !io.soft_reset
 
   val rowCounter = RegInit(0.U(4.W))
   val tileStart = inputFire && (rowCounter === 0.U)
@@ -254,7 +261,7 @@ class QuantActUnit(
     perChannel && tileStart
 
   io.qparam_req_line :=
-    perChannel &&
+    perChannel && !io.soft_reset &&
     !reqOutstanding &&
     (!shadowValid || consumeShadow)
 
@@ -317,6 +324,7 @@ class QuantActUnit(
     cores(i).io.in_mac := io.in_vec(i)
     cores(i).io.in_valid := io.in_valid(i)
     cores(i).io.param := effectiveParam(i)
+    cores(i).io.quant_en := io.quant_en
     cores(i).io.act_en := io.act_en
     cores(i).io.stall := io.stall
 
@@ -332,7 +340,7 @@ class QuantActUnit(
     VecInit(cores.map(_.io.lut_ready)).asUInt.andR
 
   io.prefetch_ready :=
-    !perChannel || (primed && io.lut_ready)
+    (!perChannel || primed) && (!io.act_en || io.lut_ready)
 
   val coreAlert =
     VecInit(cores.map(_.io.sync_alert)).asUInt.orR

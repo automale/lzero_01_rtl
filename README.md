@@ -134,3 +134,11 @@ Verilog 생성: 터미널에서 make gen 명령어를 실행합니다.
 메모리 할당: Docker Desktop 설정에서 최소 4GB~8GB 이상의 RAM을 할당해야 로켓칩 빌드 시 OutOfMemory 에러가 발생하지 않습니다.
 
 CPU 아키텍처 호환성: 본 환경은 Windows/Intel 및 Apple Silicon(M1/M2) 아키텍처 호환성을 모두 지원하도록 설계되었습니다.
+
+## GPALU / QuantAct INT8 routing preparation
+
+The signed INT8 GPALU, wide pre-activation result, independent `quant_en` / `act_en`
+controls and numeric/LUT migration contract are documented in
+[docs/GPALU_QuantAct.md](docs/GPALU_QuantAct.md). Run `make gpalu-quant-test` for
+module regressions and test-only wiring of both operation orders. Production
+VPU1/Comp routing is a later integration step.

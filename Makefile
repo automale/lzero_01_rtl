@@ -77,3 +77,11 @@ down:
 clean:
 	docker exec -it lzero_rtl_env sbt clean
 	rm -rf out/ generated/
+
+# Standalone GPALU/QuantAct modules and test-only route integration.
+.PHONY: gpalu-quant-test
+gpalu-quant-test:
+	docker exec -it lzero_rtl_env sbt \
+	  'set Compile / unmanagedSources ~= (_.filter(f => Set("GPALU.scala", "QuantActUnit.scala", "UniversalLUT.scala").contains(f.getName)))' \
+	  'set Test / unmanagedSources ~= (_.filter(f => Set("GPALU_Test.scala", "QuantAct_Test.scala", "GPALU_QuantAct_Route_Test.scala").contains(f.getName)))' \
+	  'testOnly npu.core.GPALUUnitTest npu.core.QuantActUnitTest npu.core.GPALUQuantRouteTest'

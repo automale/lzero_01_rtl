@@ -33,14 +33,13 @@ class QuantActUnitTest extends AnyFlatSpec with ChiselScalatestTester {
     val mult = ((param >> 16) & 0xffff).toInt
     val sub = in - BigInt(zp)
     val product = sub * BigInt(mult)
-    val shiftAmt = math.max(shift - 2, 0)
-    val shifted = product >> shiftAmt
-    val clamped =
-      if (shifted < 0) 0
-      else if (shifted > (LutEntries - 1)) LutEntries - 1
-      else shifted.toInt
-    if (actEn) lut(clamped)
-    else (clamped >> (IndexBits - OutBits)) & 0xff
+    if (actEn) {
+      val fixed = (product << (IndexBits - OutBits)) >> shift
+      val addr = (fixed + LutEntries / 2).max(BigInt(0)).min(BigInt(LutEntries - 1)).toInt
+      lut(addr)
+    } else {
+      (product >> shift).max(BigInt(-128)).min(BigInt(127)).toInt & 0xff
+    }
   }
 
   private def pokeIdle(dut: QuantActUnit): Unit = {
@@ -51,6 +50,7 @@ class QuantActUnitTest extends AnyFlatSpec with ChiselScalatestTester {
     }
     dut.io.param_mode.poke(0.U)
     dut.io.matrix_param.poke(0.U)
+    dut.io.quant_en.poke(true.B)
     dut.io.act_en.poke(false.B)
     dut.io.stall.poke(false.B)
     dut.io.soft_reset.poke(false.B)
@@ -122,7 +122,7 @@ class QuantActUnitTest extends AnyFlatSpec with ChiselScalatestTester {
         for (row <- 0 until 6) {
           val gold = Array.ofDim[Int](NumLines)
           for (lane <- 0 until NumLines) {
-            val x = BigInt(20 + row * 17 + lane * 9)
+            val x = BigInt(-150 + row * 37 + lane * 19)
             dut.io.in_vec(lane).poke(x.S(32.W))
             dut.io.in_valid(lane).poke(true.B)
             gold(lane) = quantGolden(x, matrixParam, actEn, lut)
@@ -223,7 +223,7 @@ class QuantActUnitTest extends AnyFlatSpec with ChiselScalatestTester {
           val params = qbLines(tile % qbLines.length)
           val gold = Array.ofDim[Int](NumLines)
           for (lane <- 0 until NumLines) {
-            val x = BigInt(80 + tile * 31 + row * 7 + lane * 5)
+            val x = BigInt(-180 + tile * 31 + row * 7 + lane * 5)
             dut.io.in_vec(lane).poke(x.S(32.W))
             dut.io.in_valid(lane).poke(true.B)
             gold(lane) = quantGolden(x, params(lane), actEn = false, lut)
@@ -257,6 +257,55 @@ class QuantActUnitTest extends AnyFlatSpec with ChiselScalatestTester {
       assert(acceptedRows == totalAcceptedRows)
       assert(expected.isEmpty)
       assert(requestCount >= 4, s"Expected >=4 QB requests, got $requestCount")
+    }
+  }
+
+  it should "support signed extrema, activation-only, bypass and per-beat controls through long stalls" in {
+    test(new QuantActUnit()) { dut =>
+      pokeIdle(dut)
+      // Linear quantization must not require a programmed activation table.
+      dut.io.prefetch_ready.expect(true.B)
+      val lut = Array.tabulate(LutEntries)(i => ((i * 37) ^ (i >> 3)) & 0xff)
+      programActivationLut(dut, lut)
+      val expected = mutable.Queue[Array[Int]]()
+      val values = Seq(BigInt(Int.MinValue), BigInt(-16384), BigInt(-129), BigInt(-128),
+        BigInt(-1), BigInt(0), BigInt(1), BigInt(127), BigInt(128), BigInt(16384), BigInt(Int.MaxValue))
+      var accepted = 0
+      for (cycle <- 0 until 260) {
+        val stalled = cycle < 220 && (cycle % 19 >= 4 && cycle % 19 <= 8)
+        val valid = accepted < 120 && cycle % 7 != 0
+        val quant = accepted % 4 < 2
+        val act = accepted % 2 == 0
+        val param = packParam(Seq(0, 1, 3, 65535)((accepted / 4) % 4), Seq(0, 1, 2, 7, 31)((accepted / 16) % 5), -7)
+        dut.io.stall.poke(stalled.B)
+        dut.io.quant_en.poke(quant.B)
+        dut.io.act_en.poke(act.B)
+        // Activation-only/bypass must not fetch QB even if param_mode is channel.
+        dut.io.param_mode.poke((if (quant) 0 else 1).U)
+        dut.io.matrix_param.poke(param.U)
+        dut.io.qparam_req_line.expect(false.B)
+        val row = Array.tabulate(NumLines) { i =>
+          val x = values((accepted + i) % values.size)
+          dut.io.in_vec(i).poke(x.S)
+          dut.io.in_valid(i).poke(valid.B)
+          quantGolden(x, if (quant) param else packParam(1, 0, 0), act, lut)
+        }
+        if (!stalled && valid) { expected.enqueue(row); accepted += 1 }
+        if (stalled) dut.io.out_valid(0).expect(false.B)
+        else if (dut.io.out_valid(0).peek().litToBoolean) {
+          assert(expected.nonEmpty)
+          val gold = expected.dequeue()
+          for (i <- 0 until NumLines) {
+            dut.io.out_valid(i).expect(true.B)
+            dut.io.out_vec(i).expect(gold(i).U)
+          }
+        }
+        dut.io.sync_alert.expect(false.B)
+        dut.clock.step()
+      }
+      assert(accepted == 120)
+      assert(expected.isEmpty)
+      dut.io.out_valid(0).expect(false.B)
     }
   }
 
